@@ -1,0 +1,14 @@
+[package]
+name = "sharevec"
+version = "0.1.0"
+edition = "2021"
+authors = ["NightEule5 <24661563+NightEule5@users.noreply.github.com>"]
+description = "Shared, constant-time clonable vectors."
+keywords = ["rc", "arc", "vec"]
+license = "Apache-2.0"
+homepage = "https://github.com/NightEule5/sharevec/"
+repository = "https://github.com/NightEule5/sharevec/"
+
+[features]
+
+[dependencies]

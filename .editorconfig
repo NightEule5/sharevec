@@ -1,0 +1,4 @@
+# Stop github from being annoying
+[*.rs]
+indent_style = tab
+tab_width = 4
