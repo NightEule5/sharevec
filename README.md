@@ -14,8 +14,10 @@ sharevec = "0.1.0"
 ```
 
 ```rust
+use sharevec::prelude::RcVec;
+
 fn main() {
-    let mut vec: sharevec::RcVec<i32> = RcVec::new();
+    let mut vec: RcVec<i32> = RcVec::new();
     // Can push to the vector as normal.
     vec.push(1);
     vec.push(2);
