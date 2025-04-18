@@ -20,14 +20,14 @@ use alloc::{
 };
 use core::alloc::{AllocError, Allocator};
 use core::cmp::Ordering;
-use core::fmt;
+use core::{fmt, slice};
 use core::hash::{Hash, Hasher};
 use core::mem::MaybeUninit;
 use core::ops::{Deref, Index, RangeBounds};
 use core::ptr::NonNull;
-use core::slice::{Iter, IterMut, SliceIndex};
+use core::slice::{ChunksExactMut, ChunksMut, Iter, IterMut, RChunksExactMut, RChunksMut, RSplitMut, RSplitNMut, SliceIndex, SplitInclusiveMut, SplitMut, SplitNMut};
 use crate::array::{FullCapacity, TryExtend, TryExtendIter, TryFromSlice, TryInsert};
-use crate::error::Result;
+use crate::error::{Result, Shared};
 use crate::marker::RcVector;
 #[cfg(feature = "vec")]
 use crate::vec::Vec;
@@ -213,7 +213,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// # Errors
 	///
-	/// Returns an error if the vector holds a shared reference to its buffer.
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty slice is always returned.
 	///
 	/// # Examples
 	///
@@ -1557,15 +1558,892 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	}
 }
 
+// Mutable slice operations
+impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC, A> {
+	/// Returns a mutable reference to the first element of the vector, or `None` if it is empty.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, `None` is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some(first)) = vec.try_first_mut() {
+	///     *first = 5;
+	/// }
+	/// assert_eq!(vec, [5, 1, 2]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.try_first_mut(), Ok(None));
+	/// ```
+	pub fn try_first_mut(&mut self) -> Result<Option<&mut T>> {
+		self.try_as_mut_slice().map(<[_]>::first_mut)
+	}
+
+	/// Returns a mutable reference to the last element of the vector, or `None` if it is empty.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, `None` is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some(last)) = vec.try_last_mut() {
+	///     *last = 5;
+	/// }
+	/// assert_eq!(vec, [0, 1, 5]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.try_last_mut(), Ok(None));
+	/// ```
+	pub fn try_last_mut(&mut self) -> Result<Option<&mut T>> {
+		self.try_as_mut_slice().map(<[_]>::last_mut)
+	}
+
+	/// Returns a mutable reference to the first element and the remaining slice of the vector, or
+	/// `None` if it is empty.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, `None` is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some((first, rest))) = vec.try_split_first_mut() {
+	///     *first = 3;
+	///     rest[0] = 4;
+	///     rest[1] = 5;
+	/// }
+	/// assert_eq!(vec, [3, 4, 5]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.try_split_first_mut(), Ok(None));
+	/// ```
+	pub fn try_split_first_mut(&mut self) -> Result<Option<(&mut T, &mut [T])>> {
+		self.try_as_mut_slice().map(<[_]>::split_first_mut)
+	}
+
+	/// Returns a mutable reference to the last element and the remaining slice of the vector, or
+	/// `None` if it is empty.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, `None` is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some((last, rest))) = vec.try_split_last_mut() {
+	///     *last = 3;
+	///     rest[0] = 4;
+	///     rest[1] = 5;
+	/// }
+	/// assert_eq!(vec, [4, 5, 3]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.try_split_last_mut(), Ok(None));
+	/// ```
+	pub fn try_split_last_mut(&mut self) -> Result<Option<(&mut T, &mut [T])>> {
+		self.try_as_mut_slice().map(<[_]>::split_last_mut)
+	}
+
+	/// Returns a mutable reference to the first `SIZE` elements of the vector, or `None` if the
+	/// vector contains less than `SIZE` elements.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector contains at least `SIZE` elements but holds a shared
+	/// reference to its buffer. If the vector contains less than `SIZE` elements, `None` is always
+	/// returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some(first)) = vec.try_first_chunk_mut::<2>() {
+	///     *first = [5, 4];
+	/// }
+	/// assert_eq!(vec, [5, 4, 2]);
+	///
+	/// assert_eq!(vec.try_first_chunk_mut::<4>(), Ok(None));
+	/// ```
+	pub fn try_first_chunk_mut<const SIZE: usize>(&mut self) -> Result<Option<&mut [T; SIZE]>> {
+		self.try_as_mut_slice().map(<[_]>::first_chunk_mut)
+	}
+
+	/// Returns a mutable reference to the last `SIZE` elements of the vector, or `None` if the
+	/// vector contains less than `SIZE` elements.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector contains at least `SIZE` elements but holds a shared
+	/// reference to its buffer. If the vector contains less than `SIZE` elements, `None` is always
+	/// returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some(last)) = vec.try_last_chunk_mut::<2>() {
+	///     *last = [10, 20];
+	/// }
+	/// assert_eq!(vec, [0, 10, 20]);
+	///
+	/// assert_eq!(vec.try_last_chunk_mut::<4>(), Ok(None));
+	/// ```
+	pub fn try_last_chunk_mut<const SIZE: usize>(&mut self) -> Result<Option<&mut [T; SIZE]>> {
+		self.try_as_mut_slice().map(<[_]>::last_chunk_mut)
+	}
+
+	/// Returns a mutable reference to the first `SIZE` elements and the remaining slice of the
+	/// vector, or `None` if it is empty.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector contains at least `SIZE` elements but holds a shared
+	/// reference to its buffer. If the vector contains less than `SIZE` elements, `None` is always
+	/// returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some((first, rest))) = vec.try_split_first_chunk_mut::<2>() {
+	///     *first = [3, 4];
+	///     rest[0] = 5;
+	/// }
+	/// assert_eq!(vec, [3, 4, 5]);
+	///
+	/// assert_eq!(vec.try_split_first_chunk_mut::<4>(), Ok(None));
+	/// ```
+	pub fn try_split_first_chunk_mut<const SIZE: usize>(&mut self) -> Result<Option<(&mut [T; SIZE], &mut [T])>> {
+		self.try_as_mut_slice().map(<[_]>::split_first_chunk_mut)
+	}
+
+	/// Returns a mutable reference to the last `SIZE` elements and the remaining slice of the
+	/// vector, or `None` if it is empty.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector contains at least `SIZE` elements but holds a shared
+	/// reference to its buffer. If the vector contains less than `SIZE` elements, `None` is always
+	/// returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some((rest, last))) = vec.try_split_last_chunk_mut::<2>() {
+	///     *last = [3, 4];
+	///     rest[0] = 5;
+	/// }
+	/// assert_eq!(vec, [5, 3, 4]);
+	///
+	/// assert_eq!(vec.try_split_last_chunk_mut::<4>(), Ok(None));
+	/// ```
+	pub fn try_split_last_chunk_mut<const SIZE: usize>(&mut self) -> Result<Option<(&mut [T], &mut [T; SIZE])>> {
+		self.try_as_mut_slice().map(<[_]>::split_last_chunk_mut)
+	}
+
+	/// Returns an element or subslice of the vector at an index, or `None` if the index is out of
+	/// bounds.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the index is within bounds but the vector holds a shared reference to
+	/// its buffer. If the index is out of bounds, `None` is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some(elem)) = vec.try_get_mut(1) {
+	///     *elem = 42;
+	/// }
+	/// assert_eq!(vec, [0, 42, 2]);
+	///
+	/// assert_eq!(vec.try_get_mut(3), Ok(None));
+	/// ```
+	pub fn try_get_mut<I>(&mut self, index: I) -> Result<Option<&mut I::Output>>
+	where
+		I: SliceIndex<[T]>
+	{
+		self.try_as_mut_slice().map(|slice| slice.get_mut(index))
+	}
+
+	/// Returns a mutable reference to the underlying array, or `None` if the vector length is not
+	/// exactly equal to the fixed capacity `N`.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector length is equal to the fixed capacity, but the vector holds a
+	/// shared reference to its buffer. If the length is less than the fixed capacity, `None` is
+	/// always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Ok(Some(array)) = vec.try_as_mut_array() {
+	///     *array = [3, 4, 5];
+	/// }
+	/// assert_eq!(vec, [3, 4, 5]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.try_as_mut_array(), Ok(None));
+	/// ```
+	pub fn try_as_mut_array(&mut self) -> Result<Option<&mut [T; N]>> {
+		if self.is_not_full() {
+			Ok(None)
+		} else if self.is_shared() {
+			Err(Shared(()))
+		} else {
+			// Safety: this pointer comes from a valid reference, and the length has been checked to
+			//  equal `N`.
+			Ok(Some(unsafe {
+				&mut *self.as_mut_ptr().cast()
+			}))
+		}
+	}
+
+	/// Swaps two elements in the vector.
+	///
+	/// If both indexes are equal, the vector is not modified.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector would be modified but holds a shared reference to its buffer.
+	///
+	/// # Panics
+	///
+	/// Panics if either index is out of bounds.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([1, 2, 3, 4, 5]);
+	///
+	/// assert!(vec.try_swap(1, 3).is_ok());
+	/// assert_eq!(vec, [1, 4, 3, 2, 5]);
+	/// ```
+	pub fn try_swap(&mut self, i: usize, j: usize) -> Result {
+		self.try_as_mut_slice()?.swap(i, j);
+		Ok(())
+	}
+
+	/// Reverses the order of elements in the vector.
+	///
+	/// # Errors
+	///
+	/// Returns an error is the vector would be modified but holds a shared reference to its buffer.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 3]);
+	/// assert!(vec.try_reverse().is_ok());
+	/// assert_eq!(vec, [3, 2, 1]);
+	/// ```
+	pub fn try_reverse(&mut self) -> Result {
+		self.try_as_mut_slice()?.reverse();
+		Ok(())
+	}
+
+	/// Returns an iterator that yields mutable references to each element.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer.
+	/// If the vector is empty, an empty iterator is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 4]);
+	///
+	/// if let Ok(iter) = vec.try_iter_mut() {
+	///     for elem in iter {
+	///         *elem += 2;
+	///     }
+	/// }
+	/// assert_eq!(vec, [3, 4, 6]);
+	/// ```
+	pub fn try_iter_mut(&mut self) -> Result<IterMut<T>> {
+		self.try_as_mut_slice().map(<[_]>::iter_mut)
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the
+	/// beginning of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last chunk will not have length `chunk_size`.
+	///
+	/// See [`try_chunks_exact_mut`] for a variant of this iterator that returns chunks of exactly
+	/// `chunk_size` elements, and [`try_rchunks_mut`] for the same iterator but starting at the end
+	/// of the vector.
+	///
+	/// [`try_chunks_exact_mut`]: Self::try_chunks_exact_mut
+	/// [`try_rchunks_mut`]: Self::try_rchunks_mut
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned.
+	///
+	/// # Panics
+	///
+	/// Panics if `chunk_size` is zero.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// if let Ok(chunks) = vec.try_chunks_mut(2) {
+	///     for chunk in chunks {
+	///         chunk.fill(count);
+	///         count += 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [1, 1, 2, 2, 3]);
+	/// ```
+	pub fn try_chunks_mut(&mut self, chunk_size: usize) -> Result<ChunksMut<T>> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.try_as_mut_slice().map(|slice| slice.chunks_mut(chunk_size))
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the
+	/// beginning of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last up to `chunk_size - 1` elements will be omitted and can
+	/// be retrieved from the `into_remainder` function of the iterator.
+	///
+	/// Due to each chunk having exactly `chunk_size` elements, the compiler can often optimize the
+	/// resulting code better than in the case of [`try_chunks_mut`].
+	///
+	/// See [`try_chunks_mut`] for a variant of this iterator that also returns the remainder as a
+	/// smaller chunk, and [`try_rchunks_exact_mut`] for the same iterator but starting at the end
+	/// of the vector.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned.
+	///
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	/// [`try_rchunks_exact_mut`]: Self::try_rchunks_exact_mut
+	///
+	/// # Panics
+	///
+	/// Panics if `chunk_size` is zero.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// if let Ok(chunks) = vec.try_chunks_exact_mut(2) {
+	///     for chunk in chunks {
+	///         chunk.fill(count);
+	///         count += 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [1, 1, 2, 2, 0]);
+	/// ```
+	pub fn try_chunks_exact_mut(&mut self, chunk_size: usize) -> Result<ChunksExactMut<T>> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.try_as_mut_slice().map(|slice| slice.chunks_exact_mut(chunk_size))
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the end
+	/// of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last chunk will not have length `chunk_size`.
+	///
+	/// See [`try_rchunks_exact_mut`] for a variant of this iterator that returns chunks of exactly
+	/// `chunk_size` elements, and [`try_chunks_mut`] for the same iterator but starting at the
+	/// beginning of the vector.
+	///
+	/// [`try_rchunks_exact_mut`]: Self::try_rchunks_exact_mut
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned.
+	///
+	/// # Panics
+	///
+	/// Panics if `chunk_size` is zero.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// if let Ok(chunks) = vec.try_rchunks_mut(2) {
+	///     for chunk in chunks {
+	///         chunk.fill(count);
+	///         count += 1;
+	///     }
+	/// }
+	/// 
+	/// assert_eq!(vec, [3, 2, 2, 1, 1]);
+	/// ```
+	pub fn try_rchunks_mut(&mut self, chunk_size: usize) -> Result<RChunksMut<T>> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.try_as_mut_slice().map(|slice| slice.rchunks_mut(chunk_size))
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the end
+	/// of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last up to `chunk_size - 1` elements will be omitted and can
+	/// be retrieved from the `into_remainder` function of the iterator.
+	///
+	/// Due to each chunk having exactly `chunk_size` elements, the compiler can often optimize the
+	/// resulting code better than in the case of [`try_chunks_mut`].
+	///
+	/// See [`try_rchunks_mut`] for a variant of this iterator that also returns the remainder as a
+	/// smaller chunk, and [`try_chunks_exact_mut`] for the same iterator but starting at the
+	/// beginning of the vector.
+	///
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	/// [`try_rchunks_mut`]: Self::try_rchunks_mut
+	/// [`try_chunks_exact_mut`]: Self::try_chunks_exact_mut
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned.
+	///
+	/// # Panics
+	///
+	/// Panics if `chunk_size` is zero.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// if let Ok(chunks) = vec.try_rchunks_exact_mut(2) {
+	///     for chunk in chunks {
+	///         chunk.fill(count);
+	///         count += 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [0, 2, 2, 1, 1]);
+	/// ```
+	pub fn try_rchunks_exact_mut(&mut self, chunk_size: usize) -> Result<RChunksExactMut<T>> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.try_as_mut_slice().map(|slice| slice.rchunks_exact_mut(chunk_size))
+	}
+
+	// Todo: add `chunks_by_mut` and `rchunks_by_mut`, stabilized in 1.77?
+
+	/// Divides the vector into two mutable slices at an index.
+	///
+	/// The first slice will contain all indices from `[0, mid)` (excluding the index `mid` itself)
+	/// and the second will contain all indices from `[mid, len)` (excluding the index `len` itself).
+	///
+	/// # Errors
+	/// 
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty and `mid` is in bounds (i.e. it equals `0`), empty slices are always
+	/// returned.
+	/// 
+	/// # Panics
+	///
+	/// Panics if `mid > len`.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([1, 0, 3, 0, 5, 6]);
+	/// 
+	/// if let Ok((left, right)) = vec.try_split_at_mut(2) {
+	///     assert_eq!(left, [1, 0]);
+	///     assert_eq!(right, [3, 0, 5, 6]);
+	///     left[1] = 2;
+	///     right[1] = 4;
+	/// }
+	/// 
+	/// assert_eq!(vec, [1, 2, 3, 4, 5, 6]);
+	/// ```
+	pub fn try_split_at_mut(&mut self, mid: usize) -> Result<(&mut [T], &mut [T])> {
+		assert!(mid <= self.len(), "midpoint out of bounds");
+		self.try_as_mut_slice().map(|slice| slice.split_at_mut(mid))
+	}
+
+	// Todo: add `split_at_mut_checked`, stabilized in 1.80, and `split_at_mut_unchecked`, stabilized
+	//  in 1.79
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`. The
+	/// matched element is not contained in the subslices.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned, and `pred` is not called.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// if let Ok(groups) = vec.try_split_mut(|&num| num % 3 == 0) {
+	///     for group in groups {
+	///         group[0] = 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [1, 40, 30, 1, 60, 1]);
+	/// ```
+	pub fn try_split_mut<F>(&mut self, pred: F) -> Result<SplitMut<T, F>>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		let slice = self.try_as_mut_slice()?;
+		Ok(slice.split_mut(pred))
+	}
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`. The
+	/// matched element is contained in the previous subslice as a terminator.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned, and `pred` is not called.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// if let Ok(groups) = vec.try_split_inclusive_mut(|&num| num % 3 == 0) {
+	///     for group in groups {
+	///         let terminator_idx = group.len() - 1;
+	///         group[terminator_idx] = 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [10, 40, 1, 20, 1, 1]);
+	/// ```
+	pub fn try_split_inclusive_mut<F>(&mut self, pred: F) -> Result<SplitInclusiveMut<T, F>>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		let slice = self.try_as_mut_slice()?;
+		Ok(slice.split_inclusive_mut(pred))
+	}
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`, starting
+	/// at the end of the vector and working backwards. The matched element is not contained in the
+	/// subslices.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned, and `pred` is not called.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// if let Ok(groups) = vec.rsplit_mut(|&num| num % 3 == 0) {
+	///     for group in groups {
+	///         group[0] = 1;
+	///     }
+	/// }
+	/// assert_eq!(vec, [1, 40, 30, 1, 60, 1]);
+	/// ```
+	pub fn try_rsplit_mut<F>(&mut self, pred: F) -> Result<RSplitMut<T, F>>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		let slice = self.try_as_mut_slice()?;
+		Ok(slice.rsplit_mut(pred))
+	}
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`, limited
+	/// to returning at most `n` items. The matched element is not contained in the subslices.
+	///
+	/// The last element returned, if any, will contain the remainder of the vector.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned, and `pred` is not called.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// if let Ok(groups) = vec.try_splitn_mut(2, |&num| num % 3 == 0) {
+ 	///     for group in groups {
+	///         group[0] = 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [1, 40, 30, 1, 60, 50]);
+	/// ```
+	pub fn try_splitn_mut<F>(&mut self, n: usize, pred: F) -> Result<SplitNMut<T, F>>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		let slice = self.try_as_mut_slice()?;
+		Ok(slice.splitn_mut(n, pred))
+	}
+
+	/// Returns an iterator over subslices separated by elements that match `pred` limited to
+	/// returning at most `n` items. This starts at the end of the vector and works backwards. The
+	/// matched element is not contained in the subslices.
+	///
+	/// The last element returned, if any, will contain the remainder of the vector.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, an empty iterator is always returned, and `pred` is not called.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// if let Ok(groups) = vec.try_rsplitn_mut(2, |&num| num % 3 == 0) {
+	///     for group in groups {
+	///         group[0] = 1;
+	///     }
+	/// }
+	///
+	/// assert_eq!(vec, [1, 40, 30, 20, 60, 1]);
+	/// ```
+	pub fn try_rsplitn_mut<F>(&mut self, n: usize, pred: F) -> Result<RSplitNMut<T, F>>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		let slice = self.try_as_mut_slice()?;
+		Ok(slice.rsplitn_mut(n, pred))
+	}
+	
+	// Todo: add `sort_unstable`, `select_nth_unstable`, etc., and `sort`, `sort_by`, etc. which
+	//  allocate intermediate memory.
+
+	/// Rotates the vector in-place such that the first `mid` elements of the vector move to the end
+	/// while the last `len - mid` elements move to the start.
+	///
+	/// After calling `rotate_left`, the element previously at index `mid` will become the first
+	/// element in the vector.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty and `mid` is in bounds (i.e. it equals `0`), [`Ok`] is always returned.
+	///
+	/// # Panics
+	///
+	/// This function will panic if `mid` is greater than the length of the vector. Note that
+	/// `mid == len` does _not_ panic and is a no-op rotation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<char, 6> = ArrayVec::from(['a', 'b', 'c', 'd', 'e', 'f']);
+	/// assert!(vec.try_rotate_left(2).is_ok());
+	/// assert_eq!(vec, ['c', 'd', 'e', 'f', 'a', 'b']);
+	/// ```
+	pub fn try_rotate_left(&mut self, mid: usize) -> Result {
+		assert!(mid <= self.len(), "midpoint out of bounds");
+		let slice = self.try_as_mut_slice()?;
+		slice.rotate_left(mid);
+		Ok(())
+	}
+
+	/// Rotates the vector in-place such that the first `len - k` elements of the vector move to the
+	/// end while the last `k` elements move to the start.
+	///
+	/// After calling `rotate_right`, the element previously at index `len - k` will become the
+	/// first element in the vector.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty and `k` is in bounds (i.e. it equals `0`), [`Ok`] is always returned.
+	///
+	/// # Panics
+	///
+	/// This function will panic if `k` is greater than the length of the vector. Note that
+	/// `k == len` does _not_ panic and is a no-op rotation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<char, 6> = ArrayVec::from(['a', 'b', 'c', 'd', 'e', 'f']);
+	/// assert!(vec.try_rotate_right(2).is_ok());
+	/// assert_eq!(vec, ['e', 'f', 'a', 'b', 'c', 'd']);
+	/// ```
+	pub fn try_rotate_right(&mut self, k: usize) -> Result {
+		assert!(k <= self.len(), "midpoint out of bounds");
+		let slice = self.try_as_mut_slice()?;
+		slice.rotate_right(k);
+		Ok(())
+	}
+
+	/// Fills the current vector length by cloning `value`.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, [`Ok`] is always returned.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 8> = ArrayVec::from([0; 8]);
+	/// assert!(vec.try_fill(1).is_ok());
+	/// assert_eq!(vec, [1; 8]);
+	/// ```
+	pub fn try_fill(&mut self, value: T) -> Result
+	where
+		T: Clone,
+	{
+		// Todo: Don't defer to <[T]>::fill because `clone` could panic, cluttering
+		//  the stacktrace.
+		let slice = self.try_as_mut_slice()?;
+		slice.fill(value);
+		Ok(())
+	}
+
+	/// Fills the current vector length with elements returned by calling a closure repeatedly.
+	///
+	/// This method uses a closure to create new values. If you'd rather [`Clone`] a given value,
+	/// use [`try_fill`]. If you want to use the [`Default`] trait to generate values, you can pass
+	/// [`Default::default`] as the argument.
+	///
+	/// [`try_fill`]: Self::try_fill
+	///
+	/// # Errors
+	///
+	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
+	/// the vector is empty, [`Ok`] is always returned and the `fill` closure is never called.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 8> = ArrayVec::from([1; 8]);
+	/// assert!(vec.try_fill_with(Default::default).is_ok());
+	/// assert_eq!(vec, [0; 10]);
+	/// ```
+	pub fn try_fill_with<F>(&mut self, mut fill: F) -> Result
+	where
+		F: FnMut() -> T,
+	{
+		// Don't defer to <[T]>::fill_with because the closure could panic, and it
+		// isn't marked `#[track_caller]`.
+		for elem in self.try_iter_mut()? {
+			*elem = fill();
+		}
+		Ok(())
+	}
+}
+
 // CoW operations
 impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVec<T, N, ATOMIC, A> {
 	/// Returns a mutable slice over the vector contents, cloning out of a shared allocation.
 	///
 	/// # Examples
-	/// 
+	///
 	/// ```
 	/// use sharevec::array::vec::rc::ArrayVec;
-	/// 
+	///
 	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 3]);
 	/// let clone = vec.clone();
 	/// 
@@ -1580,6 +2458,7 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_ne!(vec, clone);
 	/// ```
 	pub fn as_mut_slice(&mut self) -> &mut [T] {
+		// Todo: if the vector is empty, return an empty slice without allocating.
 		todo!()
 	}
 	
@@ -2304,6 +3183,959 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	/// Takes *O*(1) time.
 	pub fn pop_if<F: FnOnce(&mut T) -> bool>(&mut self, predicate: F) -> Option<T> {
 		todo!()
+	}
+}
+
+// CoW mutable slice operations
+impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVec<T, N, ATOMIC, A> {
+	/// Returns a mutable reference to the first element of the vector, or `None` if it is empty.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_first_mut`]
+	/// instead.
+	///
+	/// [`try_first_mut`]: Self::try_first_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some(first) = vec.first_mut() {
+	///     *first = 5;
+	/// }
+	/// assert_eq!(vec, [5, 1, 2]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.first_mut(), None);
+	/// ```
+	pub fn first_mut(&mut self) -> Option<&mut T> {
+		self.as_mut_slice().first_mut()
+	}
+
+	/// Returns a mutable reference to the last element of the vector, or `None` if it is empty.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_last_mut`]
+	/// instead.
+	///
+	/// [`try_last_mut`]: Self::try_last_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some(last) = vec.last_mut() {
+	///     *last = 5;
+	/// }
+	/// assert_eq!(vec, [0, 1, 5]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.last_mut(), None);
+	/// ```
+	pub fn last_mut(&mut self) -> Option<&mut T> {
+		self.as_mut_slice().last_mut()
+	}
+
+	/// Returns a mutable reference to the first element and the remaining slice of the vector, or
+	/// `None` if it is empty.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_split_first_mut`] instead.
+	///
+	/// [`try_split_first_mut`]: Self::try_split_first_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some((first, rest)) = vec.split_first_mut() {
+	///     *first = 3;
+	///     rest[0] = 4;
+	///     rest[1] = 5;
+	/// }
+	/// assert_eq!(vec, [3, 4, 5]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.split_first_mut(), None);
+	/// ```
+	pub fn split_first_mut(&mut self) -> Option<(&mut T, &mut [T])> {
+		self.as_mut_slice().split_first_mut()
+	}
+
+	/// Returns a mutable reference to the last element and the remaining slice of the vector, or
+	/// `None` if it is empty.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_split_last_mut`] instead.
+	///
+	/// [`try_split_last_mut`]: Self::try_split_last_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some((last, rest)) = vec.split_last_mut() {
+	///     *last = 3;
+	///     rest[0] = 4;
+	///     rest[1] = 5;
+	/// }
+	/// assert_eq!(vec, [4, 5, 3]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.split_last_mut(), None);
+	/// ```
+	pub fn split_last_mut(&mut self) -> Option<(&mut T, &mut [T])> {
+		self.as_mut_slice().split_last_mut()
+	}
+
+	/// Returns a mutable reference to the first `SIZE` elements of the vector, or `None` if the
+	/// vector contains less than `SIZE` elements.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_first_chunk_mut`] instead.
+	///
+	/// [`try_first_chunk_mut`]: Self::try_first_chunk_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some(first) = vec.first_chunk_mut::<2>() {
+	///     *first = [5, 4];
+	/// }
+	/// assert_eq!(vec, [5, 4, 2]);
+	///
+	/// assert_eq!(vec.first_chunk_mut::<4>(), None);
+	/// ```
+	pub fn first_chunk_mut<const SIZE: usize>(&mut self) -> Option<&mut [T; SIZE]> {
+		self.as_mut_slice().first_chunk_mut()
+	}
+
+	/// Returns a mutable reference to the last `SIZE` elements of the vector, or `None` if the
+	/// vector contains less than `SIZE` elements.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_last_chunk_mut`] instead.
+	///
+	/// [`try_last_chunk_mut`]: Self::try_last_chunk_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some(last) = vec.last_chunk_mut::<2>() {
+	///     *last = [10, 20];
+	/// }
+	/// assert_eq!(vec, [0, 10, 20]);
+	///
+	/// assert_eq!(vec.last_chunk_mut::<4>(), None);
+	/// ```
+	pub fn last_chunk_mut<const SIZE: usize>(&mut self) -> Option<&mut [T; SIZE]> {
+		self.as_mut_slice().last_chunk_mut()
+	}
+
+	/// Returns a mutable reference to the first `SIZE` elements and the remaining slice of the
+	/// vector, or `None` if it is empty.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_split_first_chunk_mut`] instead.
+	///
+	/// [`try_split_first_chunk_mut`]: Self::try_split_first_chunk_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some((first, rest)) = vec.split_first_chunk_mut::<2>() {
+	///     *first = [3, 4];
+	///     rest[0] = 5;
+	/// }
+	/// assert_eq!(vec, [3, 4, 5]);
+	///
+	/// assert_eq!(vec.split_first_chunk_mut::<4>(), None);
+	/// ```
+	pub fn split_first_chunk_mut<const SIZE: usize>(&mut self) -> Option<(&mut [T; SIZE], &mut [T])> {
+		self.as_mut_slice().split_first_chunk_mut()
+	}
+
+	/// Returns a mutable reference to the last `SIZE` elements and the remaining slice of the
+	/// vector, or `None` if it is empty.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_split_last_chunk_mut`] instead.
+	///
+	/// [`try_split_last_chunk_mut`]: Self::try_split_last_chunk_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some((rest, last)) = vec.split_last_chunk_mut::<2>() {
+	///     *last = [3, 4];
+	///     rest[0] = 5;
+	/// }
+	/// assert_eq!(vec, [5, 3, 4]);
+	///
+	/// assert_eq!(vec.split_last_chunk_mut::<4>(), None);
+	/// ```
+	pub fn split_last_chunk_mut<const SIZE: usize>(&mut self) -> Option<(&mut [T], &mut [T; SIZE])> {
+		self.as_mut_slice().split_last_chunk_mut()
+	}
+
+	/// Returns an element or subslice of the vector at an index, or `None` if the index is out of
+	/// bounds.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_get_mut`]
+	/// instead.
+	///
+	/// [`try_get_mut`]: Self::try_get_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some(elem) = vec.get_mut(1) {
+	///     *elem = 42;
+	/// }
+	/// assert_eq!(vec, [0, 42, 2]);
+	///
+	/// assert_eq!(vec.get_mut(3), None);
+	/// ```
+	pub fn get_mut<I>(&mut self, index: I) -> Option<&mut I::Output>
+	where
+		I: SliceIndex<[T]>
+	{
+		self.as_mut_slice().get_mut(index)
+	}
+
+	/// Returns a mutable reference to the underlying array, or `None` if the vector length is not
+	/// exactly equal to the fixed capacity `N`.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_as_mut_array`] instead.
+	///
+	/// [`try_as_mut_array`]: Self::try_as_mut_array
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([0, 1, 2]);
+	///
+	/// if let Some(array) = vec.as_mut_array() {
+	///     *array = [3, 4, 5];
+	/// }
+	/// assert_eq!(vec, [3, 4, 5]);
+	///
+	/// vec.clear();
+	/// assert_eq!(vec.as_mut_array(), None);
+	/// ```
+	pub fn as_mut_array(&mut self) -> Option<&mut [T; N]> {
+		self.is_full().then(|| {
+			let slice = self.as_mut_slice();
+			// Safety: this pointer comes from a valid reference, and the length has been checked to
+			//  equal `N`.
+			unsafe {
+				&mut *self.as_mut_ptr().cast()
+			}
+		})
+	}
+
+	/// Swaps two elements in the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_swap`]
+	/// instead.
+	///
+	/// [`try_swap`]: Self::try_swap
+	///
+	/// # Panics
+	///
+	/// Panics if:
+	/// - allocation fails, for example in an out-of-memory condition
+	/// - either index is out of bounds
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([1, 2, 3, 4, 5]);
+	///
+	/// vec.swap(1, 3);
+	/// assert_eq!(vec, [1, 4, 3, 2, 5]);
+	/// ```
+	pub fn swap(&mut self, i: usize, j: usize) {
+		self.as_mut_slice().swap(i, j);
+	}
+
+	/// Reverses the order of elements in the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_reverse`]
+	/// instead.
+	///
+	/// [`try_reverse`]: Self::try_reverse
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 3]);
+	/// vec.reverse();
+	/// assert_eq!(vec, [3, 2, 1]);
+	/// ```
+	pub fn reverse(&mut self) {
+		self.as_mut_slice().reverse();
+	}
+
+	/// Returns an iterator that yields mutable references to each element.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_iter_mut`]
+	/// instead.
+	///
+	/// [`try_iter_mut`]: Self::try_iter_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 4]);
+	///
+	/// for elem in vec.iter_mut() {
+	///     *elem += 2;
+	/// }
+	/// assert_eq!(vec, [3, 4, 6]);
+	/// ```
+	pub fn iter_mut(&mut self) -> IterMut<T> {
+		self.as_mut_slice().iter_mut()
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the
+	/// beginning of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last chunk will not have length `chunk_size`.
+	///
+	/// See [`try_chunks_exact_mut`] for a variant of this iterator that returns chunks of exactly
+	/// `chunk_size` elements, and [`try_rchunks_mut`] for the same iterator but starting at the end
+	/// of the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_chunks_mut`] instead.
+	///
+	/// [`try_chunks_exact_mut`]: Self::try_chunks_exact_mut
+	/// [`try_rchunks_mut`]: Self::try_rchunks_mut
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	///
+	/// # Panics
+	///
+	/// Panics if:
+	/// - allocation fails, for example in an out-of-memory condition
+	/// - `chunk_size` is zero
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// for chunk in vec.chunks_mut(2) {
+	///     chunk.fill(count);
+	///     count += 1;
+	/// }
+	///
+	/// assert_eq!(vec, [1, 1, 2, 2, 3]);
+	/// ```
+	pub fn chunks_mut(&mut self, chunk_size: usize) -> ChunksMut<T> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.as_mut_slice().chunks_mut(chunk_size)
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the
+	/// beginning of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last up to `chunk_size - 1` elements will be omitted and can
+	/// be retrieved from the `into_remainder` function of the iterator.
+	///
+	/// Due to each chunk having exactly `chunk_size` elements, the compiler can often optimize the
+	/// resulting code better than in the case of [`try_chunks_mut`].
+	///
+	/// See [`try_chunks_mut`] for a variant of this iterator that also returns the remainder as a
+	/// smaller chunk, and [`try_rchunks_exact_mut`] for the same iterator but starting at the end
+	/// of the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_chunks_exact_mut`] instead.
+	///
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	/// [`try_rchunks_exact_mut`]: Self::try_rchunks_exact_mut
+	/// [`try_chunks_exact_mut`]: Self::try_chunk_exact_mut
+	///
+	/// # Panics
+	///
+	/// Panics if:
+	/// - allocation fails, for example in an out-of-memory condition
+	/// - `chunk_size` is zero
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// for chunk in vec.chunks_exact_mut(2) {
+	///     chunk.fill(count);
+	///     count += 1;
+	/// }
+	///
+	/// assert_eq!(vec, [1, 1, 2, 2, 0]);
+	/// ```
+	pub fn chunks_exact_mut(&mut self, chunk_size: usize) -> ChunksExactMut<T> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.as_mut_slice().chunks_exact_mut(chunk_size)
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the end
+	/// of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last chunk will not have length `chunk_size`.
+	///
+	/// See [`try_rchunks_exact_mut`] for a variant of this iterator that returns chunks of exactly
+	/// `chunk_size` elements, and [`try_chunks_mut`] for the same iterator but starting at the
+	/// beginning of the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_rchunks_mut`] instead.
+	///
+	/// [`try_rchunks_exact_mut`]: Self::try_rchunks_exact_mut
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	/// [`try_rchunks_mut`]: Self::try_rchunks_mut
+	///
+	/// # Panics
+	///
+	/// Panics if:
+	/// - allocation fails, for example in an out-of-memory condition
+	/// - `chunk_size` is zero
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// for chunk in vec.rchunks_mut(2) {
+	///     chunk.fill(count);
+	///     count += 1;
+	/// }
+	///
+	/// assert_eq!(vec, [3, 2, 2, 1, 1]);
+	/// ```
+	pub fn rchunks_mut(&mut self, chunk_size: usize) -> RChunksMut<T> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.as_mut_slice().rchunks_mut(chunk_size)
+	}
+
+	/// Returns an iterator over `chunk_size` elements of the vector at a time, starting at the end
+	/// of the vector.
+	///
+	/// The chunks are mutable slices, and do not overlap. If `chunk_size` does not divide the
+	/// length of the vector, then the last up to `chunk_size - 1` elements will be omitted and can
+	/// be retrieved from the `into_remainder` function of the iterator.
+	///
+	/// Due to each chunk having exactly `chunk_size` elements, the compiler can often optimize the
+	/// resulting code better than in the case of [`try_chunks_mut`].
+	///
+	/// See [`try_rchunks_mut`] for a variant of this iterator that also returns the remainder as a
+	/// smaller chunk, and [`try_chunks_exact_mut`] for the same iterator but starting at the
+	/// beginning of the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_rchunks_exact_mut`] instead.
+	///
+	/// [`try_chunks_mut`]: Self::try_chunks_mut
+	/// [`try_rchunks_mut`]: Self::try_rchunks_mut
+	/// [`try_chunks_exact_mut`]: Self::try_chunks_exact_mut
+	/// [`try_rchunks_exact_mut`]: Self::try_rchunks_exact_mut
+	///
+	/// # Panics
+	///
+	/// Panics if:
+	/// - allocation fails, for example in an out-of-memory condition
+	/// - `chunk_size` is zero
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 5> = ArrayVec::from([0, 0, 0, 0, 0]);
+	/// let mut count = 1;
+	///
+	/// for chunk in vec.rchunks_exact_mut(2) {
+	///     chunk.fill(count);
+	///     count += 1;
+	/// }
+	///
+	/// assert_eq!(vec, [0, 2, 2, 1, 1]);
+	/// ```
+	pub fn rchunks_exact_mut(&mut self, chunk_size: usize) -> RChunksExactMut<T> {
+		assert_ne!(chunk_size, 0, "chunk size must be non-zero");
+		self.as_mut_slice().rchunks_exact_mut(chunk_size)
+	}
+
+	// Todo: add `chunks_by_mut` and `rchunks_by_mut`, stabilized in 1.77?
+
+	/// Divides the vector into two mutable slices at an index.
+	///
+	/// The first slice will contain all indices from `[0, mid)` (excluding the index `mid` itself)
+	/// and the second will contain all indices from `[mid, len)` (excluding the index `len` itself).
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_split_at_mut`] instead.
+	///
+	/// [`try_split_at_mut`]: Self::try_split_at_mut
+	///
+	/// # Panics
+	///
+	/// Panics if:
+	/// - allocation fails, for example in an out-of-memory condition
+	/// - `mid` is greater than `len`
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([1, 0, 3, 0, 5, 6]);
+	///
+	/// let (left, right) = vec.split_at_mut(2);
+	/// assert_eq!(left, [1, 0]);
+	/// assert_eq!(right, [3, 0, 5, 6]);
+	/// left[1] = 2;
+	/// right[1] = 4;
+	///
+	/// assert_eq!(vec, [1, 2, 3, 4, 5, 6]);
+	/// ```
+	pub fn split_at_mut(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
+		assert!(mid <= self.len(), "midpoint out of bounds");
+		self.as_mut_slice().split_at_mut(mid)
+	}
+
+	// Todo: add `split_at_mut_checked`, stabilized in 1.80, and `split_at_mut_unchecked`, stabilized
+	//  in 1.79
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`. The
+	/// matched element is not contained in the subslices.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_split_mut`]
+	/// instead.
+	///
+	/// [`try_split_mut`]: Self::try_split_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// for group in vec.split_mut(|&num| num % 3 == 0) {
+	///     group[0] = 1;
+	/// }
+	///
+	/// assert_eq!(vec, [1, 40, 30, 1, 60, 1]);
+	/// ```
+	pub fn split_mut<F>(&mut self, pred: F) -> SplitMut<T, F>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		self.as_mut_slice().split_mut(pred)
+	}
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`. The
+	/// matched element is contained in the previous subslice as a terminator.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_split_inclusive_mut`] instead.
+	///
+	/// [`try_split_inclusive_mut`]: Self::try_split_inclusive_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// for group in vec.split_inclusive_mut(|&num| num % 3 == 0) {
+	///     let terminator_idx = group.len() - 1;
+	///     group[terminator_idx] = 1;
+	/// }
+	///
+	/// assert_eq!(vec, [10, 40, 1, 20, 1, 1]);
+	/// ```
+	pub fn split_inclusive_mut<F>(&mut self, pred: F) -> SplitInclusiveMut<T, F>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		self.as_mut_slice().split_inclusive_mut(pred)
+	}
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`, starting
+	/// at the end of the vector and working backwards. The matched element is not contained in the
+	/// subslices.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_rsplit_mut`] instead.
+	///
+	/// [`try_rsplit_mut`]: Self::try_rsplit_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// for group in vec.rsplit_mut(|&num| num % 3 == 0) {
+	///     group[0] = 1;
+	/// }
+	/// assert_eq!(vec, [1, 40, 30, 1, 60, 1]);
+	/// ```
+	pub fn rsplit_mut<F>(&mut self, pred: F) -> RSplitMut<T, F>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		self.as_mut_slice().rsplit_mut(pred)
+	}
+
+	/// Returns an iterator over mutable subslices separated by elements that match `pred`, limited
+	/// to returning at most `n` items. The matched element is not contained in the subslices.
+	///
+	/// The last element returned, if any, will contain the remainder of the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_splitn_mut`] instead.
+	///
+	/// [`try_splitn_mut`]: Self::try_splitn_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// for group in vec.splitn_mut(2, |&num| num % 3 == 0) {
+	///     group[0] = 1;
+	/// }
+	///
+	/// assert_eq!(vec, [1, 40, 30, 1, 60, 50]);
+	/// ```
+	pub fn splitn_mut<F>(&mut self, n: usize, pred: F) -> SplitNMut<T, F>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		self.as_mut_slice().splitn_mut(n, pred)
+	}
+
+	/// Returns an iterator over subslices separated by elements that match `pred` limited to
+	/// returning at most `n` items. This starts at the end of the vector and works backwards. The
+	/// matched element is not contained in the subslices.
+	///
+	/// The last element returned, if any, will contain the remainder of the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_rsplitn_mut`] instead.
+	///
+	/// [`try_rsplitn_mut`]: Self::try_rsplitn_mut
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
+	///
+	/// for group in vec.rsplitn_mut(2, |&num| num % 3 == 0) {
+	///     group[0] = 1;
+	/// }
+	///
+	/// assert_eq!(vec, [1, 40, 30, 20, 60, 1]);
+	/// ```
+	pub fn rsplitn_mut<F>(&mut self, n: usize, pred: F) -> RSplitNMut<T, F>
+	where
+		F: FnMut(&T) -> bool,
+	{
+		self.as_mut_slice().rsplitn_mut(n, pred)
+	}
+
+	// Todo: add `sort_unstable`, `select_nth_unstable`, etc., and `sort`, `sort_by`, etc. which
+	//  allocate intermediate memory.
+
+	/// Rotates the vector in-place such that the first `mid` elements of the vector move to the end
+	/// while the last `len - mid` elements move to the start.
+	///
+	/// After calling `rotate_left`, the element previously at index `mid` will become the first
+	/// element in the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_rotate_left`] instead.
+	///
+	/// [`try_rotate_left`]: Self::try_rotate_left
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// This function will panic if `mid` is greater than the length of the vector. Note that
+	/// `mid == len` does _not_ panic and is a no-op rotation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<char, 6> = ArrayVec::from(['a', 'b', 'c', 'd', 'e', 'f']);
+	/// vec.rotate_left(2);
+	/// assert_eq!(vec, ['c', 'd', 'e', 'f', 'a', 'b']);
+	/// ```
+	pub fn rotate_left(&mut self, mid: usize) {
+		assert!(mid <= self.len(), "midpoint out of bounds");
+		self.as_mut_slice().rotate_left(mid);
+	}
+
+	/// Rotates the vector in-place such that the first `len - k` elements of the vector move to the
+	/// end while the last `k` elements move to the start.
+	///
+	/// After calling `rotate_right`, the element previously at index `len - k` will become the
+	/// first element in the vector.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_rotate_right`] instead.
+	///
+	/// [`try_rotate_right`]: Self::try_rotate_right
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// This function will panic if `k` is greater than the length of the vector. Note that
+	/// `k == len` does _not_ panic and is a no-op rotation.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<char, 6> = ArrayVec::from(['a', 'b', 'c', 'd', 'e', 'f']);
+	/// vec.rotate_right(2);
+	/// assert_eq!(vec, ['e', 'f', 'a', 'b', 'c', 'd']);
+	/// ```
+	pub fn rotate_right(&mut self, k: usize) {
+		assert!(k <= self.len(), "midpoint out of bounds");
+		self.as_mut_slice().rotate_right(k);
+	}
+
+	/// Fills the current vector length by cloning `value`.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use [`try_fill`]
+	/// instead.
+	///
+	/// [`try_fill`]: Self::try_fill
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 8> = ArrayVec::from([0; 8]);
+	/// vec.fill(1);
+	/// assert_eq!(vec, [1; 8]);
+	/// ```
+	pub fn fill(&mut self, value: T) {
+		if let Ok(slice) = self.try_as_mut_slice() {
+			slice.fill(value);
+			return
+		}
+		// Todo: if not empty, avoid cloning elements from the original vector by creating a new
+		//  vector and calling `extend`. Avoid corruption on panic by tracking how many elements
+		//  have been filled, and filling the rest by cloning from the original on panic.
+	}
+
+    /// Fills the current vector length with elements returned by calling a closure repeatedly.
+	///
+	/// This method uses a closure to create new values. If you'd rather [`Clone`] a given value,
+	/// use [`try_fill`]. If you want to use the [`Default`] trait to generate values, you can pass
+	/// [`Default::default`] as the argument.
+	///
+	/// If the vector holds a shared reference, its contents are cloned into a unique allocation. To
+	/// return an error if the vector is shared, without allocating or cloning, use
+	/// [`try_fill_with`] instead.
+	///
+	/// [`try_fill`]: Self::try_fill
+	/// [`try_fill_with`]: Self::try_fill_with
+	///
+	/// # Panics
+	///
+	/// Panics if allocation fails, for example in an out-of-memory condition.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let mut vec: ArrayVec<i32, 8> = ArrayVec::from([1; 8]);
+	/// vec.fill_with(Default::default);
+	/// assert_eq!(vec, [0; 10]);
+	/// ```
+	pub fn fill_with<F>(&mut self, mut fill: F)
+	where
+		F: FnMut() -> T,
+	{
+		if let Ok(slice) = self.try_as_mut_slice() {
+			for elem in slice {
+				*elem = fill();
+			}
+
+			return
+		}
+		// Todo: if not empty, avoid cloning by creating a new vector and calling `extend`. Avoid
+		//  corruption on panic by tracking how many elements have been filled, and filling the rest
+		//  by cloning from the original on panic.
 	}
 }
 
