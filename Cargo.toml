@@ -8,7 +8,8 @@ keywords = ["rc", "arc", "vec"]
 license = "Apache-2.0"
 homepage = "https://github.com/NightEule5/sharevec/"
 repository = "https://github.com/NightEule5/sharevec/"
-rust-version = "1.65.0"
+#rust-version = "1.65.0"
+rust-version = "1.84.0"
 
 [features]
 default = ["array-vec", "array-deque", "vec", "deque"]

@@ -65,10 +65,11 @@ mod __private {
 	use alloc::alloc::Global;
 	use core::alloc::Allocator;
 	use core::marker::PhantomData;
+	use crate::raw::RawVec;
 
 	pub struct Vec<T, const ATOMIC: bool = false, A: Allocator = Global> {
-		_t: PhantomData<T>,
-		_a: PhantomData<A>
+		pub(crate) inner: RawVec<[T], A>,
+		pub(crate) len: usize,
 	}
 }
 

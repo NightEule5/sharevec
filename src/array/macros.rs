@@ -27,7 +27,7 @@ macro_rules! extend_iter {
     ($expr:expr) => {
 		match $expr {
 			Ok(v) => Ok(v),
-			Err(TryExtendIter::FullCapacity { iter }) => Err(iter),
+			Err(TryExtendIter::FullCapacity { first, iter }) => Err((first, iter)),
 			Err(TryExtendIter::Shared { .. }) => core::hint::unreachable_unchecked()
 		}
 	};

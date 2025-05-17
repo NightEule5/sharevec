@@ -12,6 +12,17 @@ use crate::error::Shared;
 
 pub struct TryFromSlice<const N: usize>(usize);
 
+impl<const N: usize> TryFromSlice<N> {
+	/// The length of the slice.
+	pub fn len(&self) -> usize {
+		self.0
+	}
+	/// The number of elements over the capacity.
+	pub fn remainder(&self) -> usize {
+		self.len() - N
+	}
+}
+
 /// An error on insertion or push, indicating either the vector being full or shared.
 #[derive(PartialEq, Eq)]
 #[non_exhaustive]
@@ -130,6 +141,7 @@ impl std::error::Error for TryExtend { }
 pub enum TryExtendIter<T: IntoIterator> {
 	/// The vector's fixed capacity has been filled.
 	FullCapacity {
+		first: Option<T::Item>,
 		iter: T::IntoIter
 	},
 	/// The vector holds a shared reference to its buffer, and cannot be modified.

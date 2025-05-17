@@ -15,8 +15,13 @@
 		try_trait_v2,
 		extend_one,
 		coerce_unsized,
+		slice_index_methods,
 	)
 )]
+#![feature(specialization)]
+#![feature(slice_range)]
+#![feature(ptr_metadata)]
+#![feature(layout_for_ptr)]
 #![deny(
 	clippy::alloc_instead_of_core,
 	clippy::as_pointer_underscore,
@@ -149,6 +154,8 @@ pub mod vec;
 pub mod deque;
 #[cfg(any(feature = "array-deque", feature = "array-vec"))]
 pub mod array;
+mod raw;
+mod internal;
 
 pub mod prelude {
 	pub use crate::error::Shared;

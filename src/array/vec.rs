@@ -13,17 +13,14 @@
 //! |--------|--------|--------|-------~
 //! ```
 
-use alloc::{
-	boxed::Box,
-	string::String,
-	vec::Vec as StdVec
-};
+use alloc::{boxed::Box, string::String, vec, vec::Vec as StdVec};
+use alloc::alloc::Global;
 use core::alloc::{AllocError, Allocator};
 use core::cmp::Ordering;
-use core::{fmt, slice};
+use core::{fmt, iter, mem, ptr, slice};
 use core::hash::{Hash, Hasher};
-use core::mem::MaybeUninit;
-use core::ops::{Deref, Index, RangeBounds};
+use core::mem::{take, ManuallyDrop, MaybeUninit};
+use core::ops::{Deref, Index, Range, RangeBounds};
 use core::ptr::NonNull;
 use core::slice::{ChunksExactMut, ChunksMut, Iter, IterMut, RChunksExactMut, RChunksMut, RSplitMut, RSplitNMut, SliceIndex, SplitInclusiveMut, SplitMut, SplitNMut};
 use crate::array::{FullCapacity, TryExtend, TryExtendIter, TryFromSlice, TryInsert};
@@ -36,6 +33,8 @@ use drain::Drain;
 use into_iter::IntoIter;
 use unique::Unique;
 use weak::Weak;
+use crate::array::vec::internal::{Copied, CopiedIter};
+use crate::raw::{check_size, InnerBase, RawVec, VecInner};
 
 #[cfg(target_has_atomic = "ptr")]
 pub mod arc;
@@ -46,16 +45,18 @@ mod eq;
 pub(crate) mod into_iter;
 pub(crate) mod unique;
 pub(crate) mod weak;
+mod internal;
 
 // Workaround for "struct is private" error
 mod __private {
 	use alloc::alloc::Global;
 	use core::alloc::Allocator;
 	use core::marker::PhantomData;
+	use crate::raw::RawVec;
 
 	pub struct ArrayVec<T, const N: usize, const ATOMIC: bool = false, A: Allocator = Global> {
-		_t: PhantomData<T>,
-		_a: PhantomData<A>
+		pub(crate) inner: RawVec<[T; N], A>,
+		pub(crate) len: usize,
 	}
 }
 
@@ -78,7 +79,7 @@ impl<T, const N: usize, const ATOMIC: bool> ArrayVec<T, N, ATOMIC> {
 	/// ```
 	#[must_use]
 	pub fn new() -> Self {
-		todo!()
+		Self { inner: RawVec::new(Global), len: 0 }
 	}
 
 	/// Creates a new, empty vector with a fixed capacity.
@@ -100,7 +101,7 @@ impl<T, const N: usize, const ATOMIC: bool> ArrayVec<T, N, ATOMIC> {
 	/// # Ok::<_, core::alloc::AllocError>(())
 	/// ```
 	pub fn try_new() -> Result<Self, AllocError> {
-		todo!()
+		Self::try_new_in(Global)
 	}
 }
 
@@ -130,7 +131,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// ```
 	#[must_use]
 	pub fn new_in(alloc: A) -> Self {
-		todo!()
+		Self { inner: RawVec::new(alloc), len: 0 }
 	}
 
 	/// Creates a new, empty vector with a fixed capacity in the given allocator.
@@ -153,7 +154,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// # Ok::<_, core::alloc::AllocError>(())
 	/// ```
 	pub fn try_new_in(alloc: A) -> Result<Self, AllocError> {
-		todo!()
+		Ok(Self { inner: RawVec::try_new(alloc)?, len: 0 })
 	}
 	
 	/// Returns the total number of elements the vector can hold.
@@ -188,7 +189,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec.limit(), 0);
 	/// ```
 	pub const fn limit(&self) -> usize {
-		todo!()
+		self.capacity() - self.len()
 	}
 
 	/// Returns a slice over the vector contents.
@@ -206,7 +207,10 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec.as_slice(), [1, 2, 3]);
 	/// ```
 	pub fn as_slice(&self) -> &[T] {
-		todo!()
+		// Safety: elements within `len` are valid.
+		unsafe {
+			self.inner.as_slice(self.len())
+		}
 	}
 
 	/// Returns a mutable slice over the vector contents, if the vector holds a unique reference.
@@ -227,7 +231,13 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec.as_slice(), [4, 5, 6, 7, 8, 1, 2, 3]);
 	/// ```
 	pub fn try_as_mut_slice(&mut self) -> Result<&mut [T]> {
-		todo!()
+		self.check_mutable()?;
+
+		// Safety: the reference is checked to be unique or empty. There is no way for shared memory
+		//  to be modified here. Elements within `len` are valid.
+		unsafe {
+			Ok(self.inner.as_mut_slice(self.len()))
+		}
 	}
 
 	/// Returns a raw pointer to the vector's buffer.
@@ -282,7 +292,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// }
 	/// ```
 	pub fn as_ptr(&self) -> *const T {
-		todo!()
+		self.inner.ptr().as_ptr()
 	}
 	/// Returns a raw pointer to the vector's buffer.
 	///
@@ -322,7 +332,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///     }
 	///     vec.set_len(8);
 	/// }
-	/// assert_eq!(vec, [1, 2, 3, 4, 5, 6, 7, 8]);
+	/// assert_eq!(vec, [0, 1, 2, 3, 4, 5, 6, 7]);
 	/// ```
 	///
 	/// Due to the aliasing guarantee, this code is valid:
@@ -341,7 +351,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// }
 	/// ```
 	pub fn as_mut_ptr(&mut self) -> *mut T {
-		todo!()
+		self.as_non_null().as_ptr()
 	}
 	/// Returns a `NonNull` pointer to the vector's buffer.
 	///
@@ -381,7 +391,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///     }
 	///     vec.set_len(8);
 	/// }
-	/// assert_eq!(vec, [1, 2, 3, 4, 5, 6, 7, 8]);
+	/// assert_eq!(vec, [0, 1, 2, 3, 4, 5, 6, 7]);
 	/// ```
 	///
 	/// Due to the aliasing guarantee, this code is valid:
@@ -400,12 +410,12 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// }
 	/// ```
 	pub fn as_non_null(&mut self) -> NonNull<T> {
-		todo!()
+		self.inner.ptr()
 	}
 
 	/// Returns a reference to the underlying allocator.
 	pub fn allocator(&self) -> &A {
-		todo!()
+		self.inner.allocator()
 	}
 
 	/// Returns `true` if this vector holds the only strong reference to its allocated capacity,
@@ -478,7 +488,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec.strong_count(), 2);
 	/// ```
 	pub fn strong_count(&self) -> usize {
-		todo!()
+		self.inner.strong_count::<ATOMIC>().unwrap_or(1)
 	}
 	/// Returns the number of weak references to the vector's allocated capacity.
 	///
@@ -492,7 +502,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec.weak_count(), 1);
 	/// ```
 	pub fn weak_count(&self) -> usize {
-		todo!()
+		self.inner.weak_count::<ATOMIC>().unwrap_or(1)
 	}
 
 	/// If the vector is unique, returns a mutable view of the unique allocation.
@@ -528,88 +538,24 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// let clone = vec.clone();
 	/// assert!(vec.unique().is_err());
 	/// drop(clone);
-	///
-	/// let weak = vec.demote();
-	/// assert!(vec.unique().is_err());
 	/// ```
 	pub fn unique(&mut self) -> Result<Unique<T, N, A, ATOMIC>> {
-		todo!()
+		self.check_unique()?;
+
+		if self.is_weakly_shared() {
+			// Safety: elements within `len` are valid. The vector is unique.
+			unsafe {
+				if let Err(err) = self.inner.copy_out(self.len()) {
+					err.handle();
+				}
+			}
+		}
+
+		Ok(Unique { vec: self })
 	}
 	
 	/// Shortens the vector, keeping the first `len` elements and dropping the rest. If `len` is
 	/// greater or equal to the vector's current length, this has no effect.
-	///
-	/// # Leaking
-	///
-	/// Because memory may be shared and each shared vector may have a different length, truncation
-	/// may cause elements outside `len` to go out of scope without dropping. The elements' [`Drop`]
-	/// implementation can only be safely called when the vector holds a unique reference.
-	///
-	/// Rust does not require [`Drop::drop`] to be called, but this may be undesirable behavior for
-	/// types with a non-trivial `drop` implementation. For such types, use [`unique`]/[`as_unique`]
-	/// to get a mutable view which is guaranteed to drop elements, or [`is_unique`] to check for a
-	/// unique reference.
-	///
-	/// ```
-	/// use sharevec::array::vec::rc::ArrayVec;
-	///
-	/// struct WithDrop {
-	///     val: i32
-	/// }
-	///
-	/// impl Drop for WithDrop {
-	///     fn drop(&mut self) {
-	///        println!("Dropped {}", self.val);
-	///     }
-	/// }
-	///
-	/// let mut vec1 = ArrayVec::from([
-	///     WithDrop { val: 0 },
-	///     WithDrop { val: 1 },
-	///     WithDrop { val: 2 }
-	/// ]);
-	/// let mut vec2 = vec1.clone();
-	///
-	/// vec1.truncate(2);
-	/// vec2.truncate(1);
-	/// // The last element hasn't been dropped as would be expected, but it's become inaccessible
-	/// assert_eq!(vec1.len(), 2);
-	/// assert_eq!(vec2.len(), 1);
-	///
-	/// // Now only the first element is accessible. None of them have been dropped.
-	/// drop(vec1);
-	/// assert_eq!(vec2[0].val, 0);
-	/// assert!(vec2.get(1).is_none());
-	///
-	/// // The second and third elements could be overwritten without dropping!
-	/// vec2.try_push(WithDrop { val: 3 }).unwrap();
-	/// vec2.try_push(WithDrop { val: 4 }).unwrap();
-	/// // Output:
-	/// // Dropping 3
-	/// // Dropping 4
-	/// vec2.truncate(1);
-	///
-	/// vec2.try_push(WithDrop { val: 1 }).unwrap();
-	/// vec2.try_push(WithDrop { val: 2 }).unwrap();
-	/// let mut vec = vec2.clone();
-	/// // We've leaked the elements again
-	/// vec.truncate(1);
-	/// drop(vec2);
-	///
-	/// // We know the elements are still in memory, and `vec` now uniquely references them. So, an
-	/// // unsafe workaround can recover the lost elements so they can be dropped.
-	/// unsafe {
-	///     vec.set_len(3);
-	///     // Output:
-	///     // Dropping 1
-	///     // Dropping 2
-	///     vec.truncate(1);
-	/// }
-	/// ```
-	///
-	/// [`unique`]: Self::unique
-	/// [`as_unique`]: Self::as_unique
-	/// [`is_unique`]: Self::is_unique
 	///
 	/// # Examples
 	/// 
@@ -627,73 +573,22 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// vec.truncate(0);
 	/// assert_eq!(vec, []);
 	/// ```
+	#[allow(clippy::else_if_without_else)]
 	pub fn truncate(&mut self, len: usize) {
-		todo!()
+		if self.is_unique() {
+			if self.len() >= len {
+				self.len = len;
+				// Safety: the reference is checked to be unique.
+				unsafe {
+					self.inner.truncate(len);
+				}
+			}
+		} else if self.len() >= len {
+			self.len = len;
+		}
 	}
 
 	/// Clears the vector, removing all values.
-	///
-	/// # Leaking
-	///
-	/// Because memory may be shared and each shared vector may have a different length, clearing
-	/// may cause all elements to go out of scope without dropping. The elements' [`Drop`]
-	/// implementation can only be safely called when the vector holds a unique reference.
-	///
-	/// Rust does not require [`Drop::drop`] to be called, but this may be undesirable behavior for
-	/// types with a non-trivial `drop` implementation. For such types, use [`unique`]/[`as_unique`]
-	/// to get a mutable view which is guaranteed to drop elements, or [`is_unique`] to check for a
-	/// unique reference.
-	///
-	/// ```
-	/// use sharevec::array::vec::arc::ArrayVec;
-	///
-	/// struct WithDrop {
-	///     val: i32
-	/// }
-	///
-	/// impl Drop for WithDrop {
-	///     fn drop(&mut self) {
-	///        println!("Dropped {}", self.val);
-	///     }
-	/// }
-	///
-	/// let mut vec1 = ArrayVec::from([
-	///     WithDrop { val: 0 },
-	///     WithDrop { val: 1 },
-	///     WithDrop { val: 2 }
-	/// ]);
-	/// let mut vec2 = vec1.clone();
-	///
-	/// vec1.clear();
-	/// vec2.clear();
-	/// // The elements haven't been dropped as would be expected, but they've become inaccessible
-	/// assert!(vec1.is_empty());
-	/// assert!(vec2.is_empty());
-	/// drop(vec2);
-	///
-	/// // Any of the elements could be overwritten without dropping!
-	/// vec1.try_push(WithDrop { val: 3 }).unwrap();
-	/// // Output:
-	/// // Dropping 3
-	/// vec1.clear();
-	///
-	/// vec1.try_push(WithDrop { val: 0 }).unwrap();
-	///
-	/// // We know the elements are still in memory, and `vec1` now uniquely references them. So, an
-	/// // unsafe workaround can recover the lost elements so they can be dropped.
-	/// unsafe {
-	///     vec1.set_len(3);
-	///     // Output:
-	///     // Dropping 0
-	///     // Dropping 1
-	///     // Dropping 2
-	///     vec1.clear();
-	/// }
-	/// ```
-	///
-	/// [`unique`]: Self::unique
-	/// [`as_unique`]: Self::as_unique
-	/// [`is_unique`]: Self::is_unique
 	///
 	/// # Examples
 	/// 
@@ -706,7 +601,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, []);
 	/// ```
 	pub fn clear(&mut self) {
-		todo!()
+		self.truncate(0)
 	}
 
 	/// Forces the vector length to `new_len`, assuming elements outside the current length have
@@ -736,7 +631,11 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// [`spare_capacity_mut`]: Self::spare_capacity_mut
 	pub unsafe fn set_len(&mut self, new_len: usize) {
-		todo!()
+		if self.is_unique() {
+			self.inner.set_len(&mut self.len, new_len);
+		} else {
+			self.len = new_len;
+		}
 	}
 
 	/// Removes and returns the element at position `index` from the vector, replacing this element
@@ -772,7 +671,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// Takes *O*(1) time.
 	pub fn try_swap_remove(&mut self, index: usize) -> Result<T> {
-		todo!()
+		self.swap_remove_internal(index, |vec| vec.check_unique())
 	}
 
 	/// Removes and returns the element at position `index` from the vector, shifting all subsequent
@@ -809,7 +708,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// [`try_swap_remove`]: Self::try_swap_remove
 	/// [`ArrayDeque::try_pop_front`]: crate::array::deque::ArrayDeque::try_pop_front
 	pub fn try_remove(&mut self, index: usize) -> Result<T> {
-		todo!()
+		self.remove_internal(index, |vec| vec.check_unique())
 	}
 
 	/// Inserts an element at position `index` within the vector, shifting all subsequent elements to
@@ -848,7 +747,16 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// [`len`]: Self::len
 	pub fn try_insert(&mut self, index: usize, element: T) -> Result<(), TryInsert<T>> {
-		todo!()
+		self.insert_internal(
+			index,
+			element,
+			|element| TryInsert::FullCapacity { element },
+			|vec, element| if vec.is_unique() {
+				Ok(element)
+			} else {
+				Err(TryInsert::Shared { element })
+			}
+		)
 	}
 
 	/// Retains the elements specified by `predicate`, dropping the rest.
@@ -872,7 +780,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [2, 4]);
 	/// ```
 	pub fn try_retain<F: FnMut(&T) -> bool>(&mut self, predicate: F) -> Result {
-		todo!()
+		self.retain_checked(predicate)
 	}
 	/// Retains the elements specified by `predicate`, dropping the rest.
 	///
@@ -903,16 +811,25 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [3, 5]);
 	/// ```
 	pub fn try_retain_mut<F: FnMut(&mut T) -> bool>(&mut self, predicate: F) -> Result {
-		todo!()
+		self.check_mutable()?;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference.
+		unsafe {
+			self.inner.retain_mutable(&mut self.len, predicate);
+		}
+		Ok(())
 	}
 
 	/// Removes consecutive repeated elements from the vector according to the [`PartialEq`] trait
 	/// implementation. If the vector is sorted, all duplicates are removed.
+	/// 
+	/// This operation requires the vector to hold a unique reference if duplicates are found in the
+	/// middle of the vector. If the only duplicates found are at the end, the vector is truncated.
 	///
 	/// # Errors
 	///
-	/// Returns an error if the vector is immutable because it holds a shared reference to its
-	/// buffer.
+	/// Returns an error if the vector contains duplicates which cannot be removed because it holds
+	/// a shared reference to its buffer.
 	///
 	/// # Examples
 	///
@@ -925,15 +842,25 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// ```
 	pub fn try_dedup(&mut self) -> Result
 	where T: PartialEq {
-		self.try_dedup_by(|a, b| a == b)
+		if self.len() < 2 {
+			Ok(())
+		} else if self.is_unique() {
+			// Safety: `is_unique` ensures the vector holds a unique reference.
+			unsafe {
+				self.inner.dedup_by_mutable(&mut self.len, |a, b| a == b);
+			}
+			Ok(())
+		} else {
+			self.inner.dedup_by_shared(&mut self.len, PartialEq::eq)
+		}
 	}
 	/// Removes consecutive repeated elements from the vector that resolve to the same key given by
 	/// `key`. If the vector is sorted, all duplicates are removed.
 	///
 	/// # Errors
 	///
-	/// Returns an error if the vector is immutable because it holds a shared reference to its
-	/// buffer.
+	/// Returns an error if the vector contains more than one element, but is immutable because it
+	/// holds a shared reference to its buffer.
 	///
 	/// # Examples
 	///
@@ -945,7 +872,17 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [10, 20, 30, 20]);
 	/// ```
 	pub fn try_dedup_by_key<F: FnMut(&mut T) -> K, K: PartialEq>(&mut self, mut key: F) -> Result {
-		self.try_dedup_by(|a, b| key(a) == key(b))
+		if self.len() < 2 {
+			return Ok(())
+		}
+
+		self.check_unique()?;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference.
+		unsafe {
+			self.inner.dedup_by_mutable(&mut self.len, |a, b| key(a) == key(b));
+		}
+		Ok(())
 	}
 	/// Removes consecutive repeated elements from the vector that satisfy an equality `predicate`.
 	/// If the vector is sorted, all duplicates are removed.
@@ -956,8 +893,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// # Errors
 	///
-	/// Returns an error if the vector is immutable because it holds a shared reference to its
-	/// buffer.
+	/// Returns an error if the vector contains more than one element, but is immutable because it
+	/// holds a shared reference to its buffer.
 	///
 	/// # Examples
 	///
@@ -969,7 +906,17 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, ['a', 'b', 'c', 'B']);
 	/// ```
 	pub fn try_dedup_by<F: FnMut(&mut T, &mut T) -> bool>(&mut self, predicate: F) -> Result {
-		todo!()
+		if self.len() < 2 {
+			return Ok(())
+		}
+
+		self.check_unique()?;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference.
+		unsafe {
+			self.inner.dedup_by_mutable(&mut self.len, predicate);
+		}
+		Ok(())
 	}
 
 	/// Appends an element to the end of the vector if there is sufficient spare capacity, otherwise
@@ -997,7 +944,20 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// Takes *O*(1) time.
 	pub fn try_push(&mut self, value: T) -> Result<(), TryInsert<T>> {
-		todo!()
+		if self.is_full() {
+			return Err(TryInsert::FullCapacity { element: value })
+		}
+
+		if self.is_shared() {
+			return Err(TryInsert::Shared { element: value })
+		}
+
+		// Safety: `check_unique` ensures the vector holds a unique reference, and the vector is not
+		//  full.
+		unsafe {
+			self.inner.push_unchecked(&mut self.len, value);
+		}
+		Ok(())
 	}
 
 	/// Removes and returns the last element from the vector, or [`None`] if it is empty.
@@ -1022,7 +982,17 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// Takes *O*(1) time.
 	pub fn try_pop(&mut self) -> Result<Option<T>> {
-		todo!()
+		if self.is_empty() {
+			return Ok(None)
+		}
+
+		self.check_unique()?;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference, and the vector is not
+		//  empty.
+		unsafe {
+			Ok(Some(self.inner.pop_unchecked(&mut self.len)))
+		}
 	}
 
 	/// Removes and returns the last element from the vector if the predicate returns `true`, or
@@ -1050,7 +1020,22 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// Takes *O*(1) time.
 	pub fn try_pop_if<F: FnOnce(&mut T) -> bool>(&mut self, predicate: F) -> Result<Option<T>> {
-		todo!()
+		if self.is_empty() {
+			return Ok(None)
+		}
+
+		let Some(value) = self.try_last_mut()? else {
+			// Emptiness is checked above.
+			unreachable!()
+		};
+
+		Ok(predicate(value).then(||
+			// Safety: `check_unique` ensures the vector holds a unique reference, and the vector is
+			//  not empty.
+			unsafe {
+				self.inner.pop_unchecked(&mut self.len)
+			}
+		))
 	}
 
 	/// Moves all elements from `other` into this vector, leaving `other` empty. Any like[^atomic]
@@ -1084,12 +1069,31 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec1, [1, 2, 3, 4, 5, 6]);
 	/// assert_eq!(vec2, []);
 	///
-	/// assert_eq!(vec2.try_append(&mut vec3), Err(TryExtend::FullCapacity { remaining: 2 }));
-	/// assert_eq!(vec1, [1, 2, 3, 4, 5, 6, 7]);
-	/// assert_eq!(vec3, [8, 9]);
+	/// assert_eq!(vec1.try_append(&mut vec3), Err(TryExtend::FullCapacity { remaining: 2 }));
+	/// // Vectors are unmodified
+	/// assert_eq!(vec1, [1, 2, 3, 4, 5, 6]);
+	/// assert_eq!(vec3, [7, 8, 9]);
 	/// ```
 	pub fn try_append<V: RcVector<T, A, ATOMIC> + ?Sized>(&mut self, other: &mut V) -> Result<(), TryExtend> {
-		todo!()
+		if other.is_empty() {
+			return Ok(())
+		}
+
+		if let Some(remaining) = other.len().checked_sub(self.limit()) {
+			return Err(TryExtend::FullCapacity { remaining })
+		}
+
+		self.check_unique()?;
+		if other.is_shared() {
+			return Err(TryExtend::Shared)
+		}
+
+		// Safety: both vectors are unique. All elements up to `len` in `other`
+		//  are valid. `other` is checked not to overflow the capacity.
+		unsafe {
+			self.inner.append_unique(&mut self.len, other);
+		}
+		Ok(())
 	}
 
 	/// Removes the specified range from the vector, returning all removed elements as an iterator.
@@ -1103,8 +1107,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// # Errors
 	///
-	/// Returns an error if the vector is immutable because it holds a shared reference to its
-	/// buffer.
+	/// Returns an error if `range` is not empty but vector is immutable because it holds a shared
+	/// reference to its buffer. If `range` is empty, an empty iterator is always returned.
 	///
 	/// # Leaking
 	///
@@ -1112,7 +1116,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// example), the vector may have lost and leaked elements arbitrarily, including elements
 	/// outside the range.
 	///
-	/// [`forget`]: core::mem::forget
+	/// [`forget`]: mem::forget
 	///
 	/// # Examples
 	///
@@ -1124,8 +1128,26 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(removed, Ok([3, 4, 5, 6].into()));
 	/// assert_eq!(vec, [1, 2, 7, 8]);
 	/// ```
+	#[allow(clippy::multiple_unsafe_ops_per_block)]
 	pub fn try_drain<R: RangeBounds<usize>>(&mut self, range: R) -> Result<Drain<T, N, A, ATOMIC>> {
-		todo!()
+		let len = self.len();
+		let mut range = slice::range(range, ..len);
+		
+		if !range.is_empty() {
+			self.check_unique()?;
+		} else {
+			// The range is empty, and the vector may be shared. Shift the range to
+			// the end to avoid modifying anything, even the length.
+			range = len..len;
+		}
+
+		// Safety: `slice::range` ensures the range is in-bounds, and the vector is unique.
+		unsafe {
+			self.set_len(range.start);
+			let slice = slice::from_raw_parts(self.as_ptr().add(range.start), range.len());
+			let tail = range.end..len;
+			Ok(Drain::unique(tail, slice.iter(), self))
+		}
 	}
 
 	/// Returns the number of elements in the vector.
@@ -1138,9 +1160,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// let vec = ArrayVec::from([1, 2, 3]);
 	/// assert_eq!(vec.len(), 3);
 	/// ```
-	pub fn len(&self) -> usize {
-		todo!()
-	}
+	pub const fn len(&self) -> usize { self.len }
 	/// Returns `true` if the vector contains no elements.
 	///
 	/// # Examples
@@ -1154,7 +1174,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// _ = vec.push(1);
 	/// assert!(!vec.is_empty());
 	/// ```
-	pub fn is_empty(&self) -> bool {
+	pub const fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
 	/// Returns `true` if the vector contains any elements.
@@ -1170,7 +1190,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// _ = vec.push(1);
 	/// assert!(vec.is_not_empty());
 	/// ```
-	pub fn is_not_empty(&self) -> bool {
+	pub const fn is_not_empty(&self) -> bool {
 		!self.is_empty()
 	}
 	/// Returns `true` if the vector cannot hold any more elements.
@@ -1186,8 +1206,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// _ = vec.pop();
 	/// assert!(!vec.is_full());
 	/// ```
-	pub fn is_full(&self) -> bool {
-		self.len() == N
+	pub const fn is_full(&self) -> bool {
+		self.len() == self.capacity()
 	}
 	/// Returns `true` if the vector can hold more elements.
 	///
@@ -1202,7 +1222,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// _ = vec.pop();
 	/// assert!(vec.is_not_full());
 	/// ```
-	pub fn is_not_full(&self) -> bool {
+	pub const fn is_not_full(&self) -> bool {
 		!self.is_full()
 	}
 
@@ -1241,7 +1261,29 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [1, 2]);
 	/// ```
 	pub fn try_split_off(&mut self, at: usize) -> Result<Self> where A: Clone {
-		todo!()
+		#[allow(clippy::panic)]
+		#[cold]
+		#[inline(never)]
+		#[track_caller]
+		fn assert_failed(at: usize, len: usize) -> ! {
+			panic!("`at` split index (is {at}) should be <= len (is {len})");
+		}
+
+		let len = self.len();
+
+		if at > len {
+			assert_failed(at, len);
+		}
+
+		let alloc = self.allocator().clone();
+		let drain = self.try_drain(at..len)?;
+		let mut split = Self::new_in(alloc);
+		// Safety: a newly created vector always holds a unique reference. Drain, by definition,
+		//  cannot overflow the capacity.
+		unsafe {
+			split.inner.extend_trusted(&mut split.len, drain);
+		}
+		Ok(split)
 	}
 
 	/// Resizes the vector in-place to the specified length.
@@ -1288,7 +1330,29 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [1, 2, 3, 0, 0, 0, 0, 0]);
 	/// ```
 	pub fn try_resize_with<F: FnMut() -> T>(&mut self, new_len: usize, fill: F) -> Result<(), TryExtend> {
-		todo!()
+		let len = self.len();
+		if new_len > len {
+			if self.is_full() {
+				return Err(TryExtend::FullCapacity { remaining: new_len - len })
+			}
+
+			self.check_unique()?;
+			let fill_len = new_len.min(N) - len;
+			// Safety: `check_unique` ensures the vector holds a unique reference, and
+			//  `fill_len` will always fit in the vector.
+			unsafe {
+				self.inner.extend_with(&mut self.len, fill_len, fill);
+			}
+
+			if new_len > N {
+				Err(TryExtend::FullCapacity { remaining: new_len - N })
+			} else {
+				Ok(())
+			}
+		} else {
+			self.truncate(new_len);
+			Ok(())
+		}
 	}
 
 	/// Returns the remaining spare capacity of the vector as a slice of uninitialized elements.
@@ -1322,7 +1386,15 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [0, 1, 2]);
 	/// ```
 	pub fn try_spare_capacity_mut(&mut self) -> Result<&mut [MaybeUninit<T>]> {
-		todo!()
+		if self.is_not_full() {
+			self.check_unique()?;
+		} 
+
+		// Safety: the check above ensures the vector holds a unique reference if it is not full. If
+		//  it is full, this slice will be empty and cannot be modified anyway.
+		Ok(unsafe {
+			self.inner.as_uninit_slice(self.len())
+		})
 	}
 
 	/// Mutably indexes the vector, if it holds a unique reference.
@@ -1354,7 +1426,12 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// ```
 	#[cfg(feature = "unstable-traits")]
 	pub fn try_index_mut<I: SliceIndex<[T]>>(&mut self, index: I) -> Result<&mut <Self as Index<I>>::Output> {
-		todo!()
+		self.check_unique()?;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference.
+		Ok(unsafe {
+			index.index_mut(self.inner.as_mut_slice(self.len()))
+		})
 	}
 
 	/// Appends elements from an iterator to the vector.
@@ -1381,7 +1458,30 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec, [1, 2, 3]);
 	/// ```
 	pub fn try_extend<I: IntoIterator<Item = T>>(&mut self, iter: I) -> Result<(), TryExtendIter<I>> {
-		todo!()
+		if self.is_full() {
+			return Err(TryExtendIter::FullCapacity { first: None, iter: iter.into_iter() })
+		}
+
+		if self.is_shared() {
+			return Err(TryExtendIter::Shared { iter })
+		}
+
+		let mut iter = iter.into_iter();
+		for v in iter.by_ref() {
+			if self.is_full() {
+				return Err(TryExtendIter::FullCapacity {
+					first: Some(v),
+					iter
+				})
+			}
+			
+			// Safety: the vector is checked to be unique and not full.
+			unsafe {
+				self.inner.push_unchecked(&mut self.len, v);
+			}
+		}
+		
+		Ok(())
 	}
 	/// Appends referenced elements from an iterator to the vector by copying.
 	///
@@ -1409,7 +1509,30 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// ```
 	pub fn try_extend_ref<'a, I: IntoIterator<Item = &'a T>>(&mut self, iter: I) -> Result<(), TryExtendIter<I>>
 	where T: Copy + 'a {
-		todo!()
+		if self.is_full() {
+			return Err(TryExtendIter::FullCapacity { first: None, iter: iter.into_iter() })
+		}
+
+		if self.is_shared() {
+			return Err(TryExtendIter::Shared { iter })
+		}
+
+		let mut iter = iter.into_iter();
+		for v in iter.by_ref() {
+			if self.is_full() {
+				return Err(TryExtendIter::FullCapacity {
+					first: Some(v),
+					iter
+				})
+			}
+
+			// Safety: the vector is checked to be unique and not full.
+			unsafe {
+				self.inner.push_unchecked(&mut self.len, *v);
+			}
+		}
+
+		Ok(())
 	}
 	
 	/// Consumes the vector, returning an iterator over its contents.
@@ -1428,7 +1551,11 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert!(iter.eq([1, 2, 3]));
 	/// ```
 	pub fn try_into_iter(self) -> Result<IntoIter<T, N, A, ATOMIC>, Self> {
-		todo!()
+		if self.is_unique() {
+			Ok(IntoIter::new_owned(self))
+		} else {
+			Err(self)
+		}
 	}
 	
 	/// Converts the fixed-capacity vector into a variable-capacity vector of capacity `N`.
@@ -1450,7 +1577,11 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// ```
 	#[cfg(feature = "vec")]
 	pub fn into_vec(self) -> Vec<T, ATOMIC, A> {
-		todo!()
+		let md = ManuallyDrop::new(self);
+
+		// Safety: `inner` is moved out of the vector without dropping.
+		let inner = unsafe { ptr::read(&md.inner) };
+		Vec { inner: inner.into_slice(), len: md.len }
 	}
 }
 
@@ -1494,7 +1625,28 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	/// assert_eq!(vec, [1, 2, 3, 0, 0, 0, 0, 0]);
 	/// ```
 	pub fn try_resize(&mut self, new_len: usize, value: T) -> Result<(), TryExtend> {
-		todo!()
+		let len = self.len();
+		if new_len > len {
+			if self.is_full() {
+				return Err(TryExtend::FullCapacity { remaining: new_len - len })
+			}
+			
+			self.check_unique()?;
+			let fill_len = new_len.min(N) - len;
+			// Safety: `check_unique` ensures the vector holds a unique reference.
+			unsafe {
+				self.inner.extend_repeated(&mut self.len, fill_len, value);
+			}
+
+			if new_len > N {
+				Err(TryExtend::FullCapacity { remaining: new_len - N })
+			} else {
+				Ok(())
+			}
+		} else {
+			self.truncate(new_len);
+			Ok(())
+		}
 	}
 
 	/// Clones and appends all elements in a slice to the vector.
@@ -1521,7 +1673,30 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	/// assert_eq!(vec, [1, 2, 3, 4]);
 	/// ```
 	pub fn try_extend_from_slice(&mut self, other: &[T]) -> Result<(), TryExtend> {
-		todo!()
+		if other.is_empty() {
+			return Ok(())
+		}
+
+		if self.is_full() {
+			return Err(TryExtend::FullCapacity { remaining: other.len() })
+		}
+
+		self.check_unique()?;
+
+		let len = self.limit().min(other.len());
+		let remaining = other.len() - len;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference. The length is checked
+		//  to not overflow the capacity.
+		unsafe {
+			self.inner.extend_from_slice(&mut self.len, (&other[..len]).into());
+		}
+
+		if remaining > 0 {
+			Err(TryExtend::FullCapacity { remaining })
+		} else {
+			Ok(())
+		}
 	}
 	/// Clones and appends elements from `range` to the end of the vector.
 	///
@@ -1554,7 +1729,35 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	/// assert_eq!(vec, [1, 2, 3, 4, 2, 3, 1, 2]);
 	/// ```
 	pub fn try_extend_from_within<R: RangeBounds<usize>>(&mut self, range: R) -> Result<(), TryExtend> {
-		todo!()
+		let vec_len = self.len();
+		let range = slice::range(range, ..vec_len);
+
+		if range.is_empty() {
+			return Ok(())
+		}
+
+		if self.is_full() {
+			return Err(TryExtend::FullCapacity { remaining: range.len() })
+		}
+
+		self.check_unique()?;
+
+		let len = self.limit().min(range.len());
+		let remaining = range.len() - len;
+		
+
+		// Safety: this range is checked to be in-bounds and not longer than the
+		//  available capacity. `check_unique` ensures the vector holds a unique
+		//  reference.
+		unsafe {
+			self.inner.extend_from_within(&mut self.len, range.start..range.start + len);
+		}
+
+		if remaining > 0 {
+			Err(TryExtend::FullCapacity { remaining })
+		} else {
+			Ok(())
+		}
 	}
 }
 
@@ -2047,7 +2250,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///         count += 1;
 	///     }
 	/// }
-	/// 
+	///
 	/// assert_eq!(vec, [3, 2, 2, 1, 1]);
 	/// ```
 	pub fn try_rchunks_mut(&mut self, chunk_size: usize) -> Result<RChunksMut<T>> {
@@ -2112,11 +2315,11 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// and the second will contain all indices from `[mid, len)` (excluding the index `len` itself).
 	///
 	/// # Errors
-	/// 
+	///
 	/// Returns an error if the vector is not empty and holds a shared reference to its buffer. If
 	/// the vector is empty and `mid` is in bounds (i.e. it equals `0`), empty slices are always
 	/// returned.
-	/// 
+	///
 	/// # Panics
 	///
 	/// Panics if `mid > len`.
@@ -2127,14 +2330,14 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// use sharevec::array::vec::rc::ArrayVec;
 	///
 	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([1, 0, 3, 0, 5, 6]);
-	/// 
+	///
 	/// if let Ok((left, right)) = vec.try_split_at_mut(2) {
 	///     assert_eq!(left, [1, 0]);
 	///     assert_eq!(right, [3, 0, 5, 6]);
 	///     left[1] = 2;
 	///     right[1] = 4;
 	/// }
-	/// 
+	///
 	/// assert_eq!(vec, [1, 2, 3, 4, 5, 6]);
 	/// ```
 	pub fn try_split_at_mut(&mut self, mid: usize) -> Result<(&mut [T], &mut [T])> {
@@ -2224,7 +2427,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// let mut vec: ArrayVec<i32, 6> = ArrayVec::from([10, 40, 30, 20, 60, 50]);
 	///
-	/// if let Ok(groups) = vec.rsplit_mut(|&num| num % 3 == 0) {
+	/// if let Ok(groups) = vec.try_rsplit_mut(|&num| num % 3 == 0) {
 	///     for group in groups {
 	///         group[0] = 1;
 	///     }
@@ -2305,7 +2508,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 		let slice = self.try_as_mut_slice()?;
 		Ok(slice.rsplitn_mut(n, pred))
 	}
-	
+
 	// Todo: add `sort_unstable`, `select_nth_unstable`, etc., and `sort`, `sort_by`, etc. which
 	//  allocate intermediate memory.
 
@@ -2393,10 +2596,14 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	where
 		T: Clone,
 	{
-		// Todo: Don't defer to <[T]>::fill because `clone` could panic, cluttering
-		//  the stacktrace.
-		let slice = self.try_as_mut_slice()?;
-		slice.fill(value);
+		// Don't defer to `<[T]>::fill` because `clone` could panic, cluttering
+		// the backtrace. The compiler appears to be smart enough to not need
+		// specialization over copy anyway, replacing this loop with `memset`
+		// where appropriate.
+		for elem in self.try_as_mut_slice()? {
+			elem.clone_from(&value);
+		}
+		
 		Ok(())
 	}
 
@@ -2420,7 +2627,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	///
 	/// let mut vec: ArrayVec<i32, 8> = ArrayVec::from([1; 8]);
 	/// assert!(vec.try_fill_with(Default::default).is_ok());
-	/// assert_eq!(vec, [0; 10]);
+	/// assert_eq!(vec, [0; 8]);
 	/// ```
 	pub fn try_fill_with<F>(&mut self, mut fill: F) -> Result
 	where
@@ -2446,7 +2653,7 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	///
 	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 3]);
 	/// let clone = vec.clone();
-	/// 
+	///
 	/// let slice = vec.as_mut_slice();
 	/// for v in slice {
 	///     *v *= 2;
@@ -2458,8 +2665,13 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_ne!(vec, clone);
 	/// ```
 	pub fn as_mut_slice(&mut self) -> &mut [T] {
-		// Todo: if the vector is empty, return an empty slice without allocating.
-		todo!()
+		self.make_mutable();
+
+		// Safety: `make_mutable` ensures the vector holds a unique reference, or that it's empty,
+		//  in which case no contents will be modified.
+		unsafe {
+			self.inner.as_mut_slice(self.len())
+		}
 	}
 	
 	/// Returns the remaining spare capacity of the vector as a slice of uninitialized elements,
@@ -2497,7 +2709,15 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, [0, 1, 2]);
 	/// ```
 	pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
-		todo!()
+		if self.is_not_full() {
+			self.make_unique();
+		}
+
+		// Safety: the check above ensures the vector holds a unique reference if it is not full. If
+		//  it is full, this slice will be empty and cannot be modified anyway.
+		unsafe {
+			self.inner.as_uninit_slice(self.len())
+		}
 	}
 
 	/// Clones the vector contents out of a shared allocation, making the vector mutable.
@@ -2522,7 +2742,7 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// 
 	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 3]);
 	/// let clone = vec.clone();
-	/// 
+	///
 	/// let mut unique = vec.as_unique();
 	/// unique.clear();
 	/// unique.extend_from_slice(&[4, 5, 6]).unwrap();
@@ -2535,7 +2755,21 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_ne!(vec, clone);
 	/// ```
 	pub fn as_unique(&mut self) -> Unique<T, N, A, ATOMIC> {
-		todo!()
+		self.make_unique();
+
+		if self.is_weakly_shared() {
+			// We have a unique vector, but some weak pointers exist which may be promoted while the
+			// unique wrapper exists, causing the vector to shared *and* mutable. We need to move
+			// the contents into a new vector before returning, but don't need to clone.
+			// Safety: the vector has been made unique.
+			unsafe {
+				if let Err(err) = self.inner.copy_out(self.len()) {
+					err.handle();
+				}
+			}
+		}
+
+		Unique { vec: self }
 	}
 
 	/// Clones the vector contents out of a [shared] allocation, making the vector mutable. Returns
@@ -2574,7 +2808,19 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_ne!(vec, clone);
 	/// ```
 	pub fn try_as_unique(&mut self) -> Result<Unique<T, N, A, ATOMIC>, AllocError> {
-		todo!()
+		self.try_make_unique()?;
+
+		if self.is_weakly_shared() {
+			// We have a unique vector, but some weak pointers exist which may be promoted while the
+			// unique wrapper exists, causing the vector to be shared *and* mutable. We need to move
+			// the contents into a new vector before returning, but don't need to clone.
+			// Safety: the vector has been made unique.
+			unsafe {
+				self.inner.copy_out(self.len())?;
+			}
+		}
+
+		Ok(Unique { vec: self })
 	}
 
 	/// Removes and returns the element at position `index` from the vector, replacing this element
@@ -2609,7 +2855,19 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, ['c', 'd']);
 	/// ```
 	pub fn swap_remove(&mut self, index: usize) -> T {
-		todo!()
+		if self.is_not_empty() && index == self.len() - 1 {
+			// Avoid cloning the entire vector for a pop operation.
+			// Safety: the vector is not empty.
+			return unsafe {
+				self.pop().unwrap_unchecked()
+			}
+		}
+		
+		let Ok(v) = self.swap_remove_internal(index, |vec| {
+			vec.make_unique();
+			Ok::<_, ()>(())
+		}) else { unreachable!() };
+		v
 	}
 
 	/// Removes and returns the element at position `index` from the vector, shifting all subsequent
@@ -2648,7 +2906,19 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// [`swap_remove`]: Self::swap_remove
 	/// [`ArrayDeque::pop_front`]: crate::array::deque::ArrayDeque::pop_front
 	pub fn remove(&mut self, index: usize) -> T {
-		todo!()
+		if self.is_not_empty() && index == self.len() - 1 {
+			// Avoid cloning the entire vector for a pop operation.
+			// Safety: the vector is not empty.
+			return unsafe {
+				self.pop().unwrap_unchecked()
+			}
+		}
+
+		let Ok(v) = self.remove_internal(index, |vec| {
+			vec.make_unique();
+			Ok::<_, ()>(())
+		}) else { unreachable!() };
+		v
 	}
 
 	/// Inserts an element at position `index` within the vector, shifting all subsequent elements to
@@ -2692,7 +2962,10 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	///
 	/// [`len`]: Self::len
 	pub fn insert(&mut self, index: usize, element: T) -> Result<(), T> {
-		todo!()
+		self.insert_internal(index, element, |e| e, |vec, elem| {
+			vec.make_unique();
+			Ok(elem)
+		})
 	}
 
 	/// Retains the elements specified by `predicate`, dropping the rest.
@@ -2715,8 +2988,8 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// vec.retain(|&x| x % 2 == 0);
 	/// assert_eq!(vec, [2, 4]);
 	/// ```
-	pub fn retain<F: FnMut(&T) -> bool>(&mut self, predicate: F) {
-		todo!()
+	pub fn retain<F: FnMut(&T) -> bool>(&mut self, mut predicate: F) {
+		self.retain_internal_clone(|e| predicate(e));
 	}
 
 	/// Retains the elements specified by `predicate`, dropping the rest.
@@ -2745,7 +3018,7 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, [3, 5]);
 	/// ```
 	pub fn retain_mut<F: FnMut(&mut T) -> bool>(&mut self, predicate: F) {
-		todo!()
+		self.retain_internal_clone(predicate);
 	}
 
 	/// Removes consecutive repeated elements from the vector according to the [`PartialEq`] trait
@@ -2765,8 +3038,17 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// vec.dedup();
 	/// assert_eq!(vec, [1, 2, 3, 2]);
 	/// ```
+	#[allow(clippy::else_if_without_else)]
 	pub fn dedup(&mut self) where T: PartialEq {
-		todo!()
+		if self.len < 2 || self.is_unique() {
+			// Safety: `is_unique` ensures the vector holds a unique reference
+			//  if it would be modified.
+			unsafe {
+				self.inner.dedup_by_mutable(&mut self.len, |a, b| a == b);
+			}
+		} else if self.len >= 2 && self.is_shared() {
+			todo!("implement `dedup_by_clone`")
+		}
 	}
 	/// Removes consecutive repeated elements from the vector that resolve to the same key given by
 	/// `key`. If the vector is sorted, all duplicates are removed.
@@ -2785,8 +3067,17 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// vec.dedup_by_key(|&mut x| x / 10);
 	/// assert_eq!(vec, [10, 20, 30, 20]);
 	/// ```
-	pub fn dedup_by_key<F: FnMut(&mut T) -> K, K: PartialEq>(&mut self, key: F) {
-		todo!()
+	#[allow(clippy::else_if_without_else)]
+	pub fn dedup_by_key<F: FnMut(&mut T) -> K, K: PartialEq>(&mut self, mut key: F) {
+		if self.len < 2 || self.is_unique() {
+			// Safety: `is_unique` ensures the vector holds a unique reference
+			//  if it would be modified.
+			unsafe {
+				self.inner.dedup_by_mutable(&mut self.len, |a, b| key(a) == key(b));
+			}
+		} else if self.len >= 2 && self.is_shared() {
+			todo!("implement `dedup_by_clone`")
+		}
 	}
 	/// Removes consecutive repeated elements from the vector that satisfy an equality `predicate`.
 	/// If the vector is sorted, all duplicates are removed.
@@ -2809,8 +3100,17 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// vec.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 	/// assert_eq!(vec, ['a', 'b', 'c', 'B']);
 	/// ```
+	#[allow(clippy::else_if_without_else)]
 	pub fn dedup_by<F: FnMut(&mut T, &mut T) -> bool>(&mut self, predicate: F) {
-		todo!()
+		if self.len < 2 || self.is_unique() {
+			// Safety: `is_unique` ensures the vector holds a unique reference
+			//  if it would be modified.
+			unsafe {
+				self.inner.dedup_by_mutable(&mut self.len, predicate);
+			}
+		} else if self.len >= 2 && self.is_shared() {
+			todo!("implement `dedup_by_clone`")
+		}
 	}
 
 	/// Appends an element to the end of the vector if there is sufficient spare capacity, otherwise
@@ -2841,16 +3141,26 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	///
 	/// Takes *O*(1) time for unique vectors, *O*(*n*) time for shared vectors.
 	pub fn push(&mut self, value: T) -> Result<(), T> {
-		todo!()
+		if self.is_full() {
+			Err(value)
+		} else {
+			self.make_unique();
+			// Safety: `make_unique` ensures the vector holds a unique reference, and the vector is
+			//  not full.
+			unsafe {
+				self.inner.push_unchecked(&mut self.len, value);
+			}
+			Ok(())
+		}
 	}
 
 	/// Moves all elements from `other` into the vector, leaving `other` empty. Any like[^atomic]
 	/// vector type from this crate may be appended, even array vectors with a different fixed
 	/// capacity.
 	///
-	/// If one vector is shared, its elements are cloned into the unique one. If both are shared,
-	/// their contents will be cloned into a unique allocation. A fallible version is also provided:
-	/// [`try_append`].
+	/// If one vector is shared, its contents are cloned into a unique allocation before proceeding.
+	/// If `other` is shared, its contents are cloned into `self`. A fallible version is also
+	/// provided: [`try_append`].
 	///
 	/// [^atomic]: the only restriction is that both vectors must either be atomic or non-atomic;
 	/// atomic vectors may be only appended to other atomic vectors, non-atomic vectors may only be
@@ -2893,12 +3203,38 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec1, [1, 2, 3, 4, 5, 6]);
 	/// assert_eq!(vec2, []);
 	///
-	/// assert_eq!(vec2.append(&mut vec3), Err(FullCapacity { remaining: 2 }));
-	/// assert_eq!(vec1, [1, 2, 3, 4, 5, 6, 7]);
-	/// assert_eq!(vec3, [8, 9]);
+	/// assert_eq!(vec1.append(&mut vec3), Err(FullCapacity { remaining: 2 }));
+	/// // Vectors are unmodified
+	/// assert_eq!(vec1, [1, 2, 3, 4, 5, 6]);
+	/// assert_eq!(vec3, [7, 8, 9]);
 	/// ```
 	pub fn append<V: RcVector<T, A, ATOMIC> + ?Sized>(&mut self, other: &mut V) -> Result<(), FullCapacity> {
-		todo!()
+		if other.is_empty() {
+			return Ok(())
+		}
+
+		if let Some(remaining) = other.len().checked_sub(self.limit()) {
+			return Err(FullCapacity { remaining })
+		}
+
+		self.make_unique();
+
+		if other.is_shared() {
+			// Safety: `self` is unique. All elements up to `len` in `other` are
+			//  valid. `other` is checked to not overflow the capacity.
+			unsafe {
+				self.inner.append_shared(&mut self.len, other);
+			}
+		} else {
+			// Safety: both vectors are unique. All elements up to `len` in
+			//  `other` are valid. `other` is checked to not overflow the
+			//  capacity.
+			unsafe {
+				self.inner.append_unique(&mut self.len, other);
+			}
+		}
+		
+		Ok(())
 	}
 
 	/// Removes the specified range from the vector, returning all removed elements as an iterator.
@@ -2917,7 +3253,7 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// example), the vector may have lost and leaked elements arbitrarily, including elements outside
 	/// the range.
 	///
-	/// [`forget`]: core::mem::forget
+	/// [`forget`]: mem::forget
 	///
 	/// # Examples
 	///
@@ -2929,8 +3265,27 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert!(removed.eq([3, 4, 5, 6]));
 	/// assert_eq!(vec, [1, 2, 7, 8]);
 	/// ```
+	#[allow(clippy::multiple_unsafe_ops_per_block)]
 	pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Drain<T, N, A, ATOMIC> {
-		todo!()
+		let len = self.len();
+		let mut range = slice::range(range, ..len);
+		
+		if range.is_empty() {
+			range = len..len;
+		}
+
+		// Safety: elements within the range are valid.
+		unsafe {
+			self.set_len(range.start);
+			let slice = slice::from_raw_parts(self.as_ptr().add(range.start), range.len());
+			let tail = range.end..len;
+			
+			if range.is_empty() || self.is_unique() {
+				Drain::unique(tail, slice.iter(), self)
+			} else {
+				Drain::cloning(tail, slice.iter(), self)
+			}
+		}
 	}
 
 	/// Splits the vector into two at the given index.
@@ -2947,8 +3302,8 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// If the vector is shared, the elements after `at` are cloned into the returned vector. A
 	/// fallible version is also provided: [`try_split_off`].
 	///
-	/// [`mem::take`]: core::mem::take
-	/// [`mem::replace`]: core::mem::replace
+	/// [`mem::take`]: take
+	/// [`mem::replace`]: mem::replace
 	/// [`truncate`]: Self::truncate
 	/// [`drain`]: Self::drain
 	/// [`try_split_off`]: Self::try_split_off
@@ -2984,7 +3339,28 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// ```
 	#[must_use = "use `.truncate()` if you don't need the other half"]
 	pub fn split_off(&mut self, at: usize) -> Self {
-		todo!()
+		#[allow(clippy::panic)]
+		#[cold]
+		#[inline(never)]
+		#[track_caller]
+		fn assert_failed(at: usize, len: usize) -> ! {
+			panic!("`at` split index (is {at}) should be <= len (is {len})");
+		}
+
+		let len = self.len();
+
+		if at > len {
+			assert_failed(at, len);
+		}
+
+		let alloc = self.allocator().clone();
+		let drain = self.drain(at..len);
+		let mut split = Self::new_in(alloc);
+		// Safety: a newly created vector always holds a unique reference.
+		unsafe {
+			split.inner.extend_trusted(&mut split.len, drain);
+		}
+		split
 	}
 
 	/// Resizes the vector in-place to the specified length.
@@ -3030,7 +3406,29 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, [1, 2, 3, 0, 0, 0, 0, 0]);
 	/// ```
 	pub fn resize_with<F: FnMut() -> T>(&mut self, new_len: usize, fill: F) -> Result<(), FullCapacity> {
-		todo!()
+		let len = self.len();
+		if new_len > len {
+			if self.is_full() {
+				return Err(FullCapacity { remaining: new_len - len })
+			}
+			
+			self.make_unique();
+			let fill_len = new_len.min(N) - len;
+			// Safety: `check_unique` ensures the vector holds a unique reference, and
+			//  `fill_len` will always fit in the vector.
+			unsafe {
+				self.inner.extend_with(&mut self.len, fill_len, fill);
+			}
+
+			if new_len > N {
+				Err(FullCapacity { remaining: new_len - N })
+			} else {
+				Ok(())
+			}
+		} else {
+			self.truncate(new_len);
+			Ok(())
+		}
 	}
 
 	/// Resizes the vector in-place to the specified length, cloning `value` into additional space
@@ -3067,7 +3465,29 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, [1, 2, 3, 0, 0, 0, 0, 0]);
 	/// ```
 	pub fn resize(&mut self, new_len: usize, value: T) -> Result<(), FullCapacity> {
-		todo!()
+		let len = self.len();
+		if new_len > len {
+			if self.is_full() {
+				return Err(FullCapacity { remaining: new_len - len })
+			}
+
+			self.make_unique();
+			let fill_len = new_len.min(N) - len;
+			// Safety: `check_unique` ensures the vector holds a unique reference, and
+			//  `fill_len` will always fit in the vector.
+			unsafe {
+				self.inner.extend_repeated(&mut self.len, fill_len, value);
+			}
+
+			if new_len > N {
+				Err(FullCapacity { remaining: new_len - N })
+			} else {
+				Ok(())
+			}
+		} else {
+			self.truncate(new_len);
+			Ok(())
+		}
 	}
 
 	/// Clones and appends all elements in a slice to the vector.
@@ -3092,7 +3512,30 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, [1, 2, 3, 4]);
 	/// ```
 	pub fn extend_from_slice(&mut self, other: &[T]) -> Result<(), FullCapacity> {
-		todo!()
+		if other.is_empty() {
+			return Ok(())
+		}
+
+		if self.is_full() {
+			return Err(FullCapacity { remaining: other.len() })
+		}
+
+		self.make_unique();
+
+		let len = self.limit().min(other.len());
+		let remaining = other.len() - len;
+
+		// Safety: `check_unique` ensures the vector holds a unique reference. The length is checked
+		//  to not overflow the capacity.
+		unsafe {
+			self.inner.extend_from_slice(&mut self.len, (&other[..len]).into());
+		}
+
+		if remaining > 0 {
+			Err(FullCapacity { remaining })
+		} else {
+			Ok(())
+		}
 	}
 	/// Clones and appends elements from `range` to the end of the vector.
 	///
@@ -3123,7 +3566,34 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	/// assert_eq!(vec, [1, 2, 3, 4, 2, 3, 1, 2]);
 	/// ```
 	pub fn extend_from_within<R: RangeBounds<usize>>(&mut self, range: R) -> Result<(), FullCapacity> {
-		todo!()
+		let vec_len = self.len();
+		let range = slice::range(range, ..vec_len);
+
+		if range.is_empty() {
+			return Ok(())
+		}
+
+		if self.is_full() {
+			return Err(FullCapacity { remaining: range.len() })
+		}
+
+		self.make_unique();
+
+		let len = self.limit().min(range.len());
+		let remaining = range.len() - len;
+		
+		// Safety: this range is checked to be in-bounds and not longer than the
+		//  available capacity. `check_unique` ensures the vector holds a unique
+		//  reference.
+		unsafe {
+			self.inner.extend_from_within(&mut self.len, range.start..range.start + len);
+		}
+
+		if remaining > 0 {
+			Err(FullCapacity { remaining })
+		} else {
+			Ok(())
+		}
 	}
 }
 
@@ -3157,7 +3627,28 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	/// assert_eq!(vec.pop(), None);
 	/// ```
 	pub fn pop(&mut self) -> Option<T> {
-		todo!()
+		let ptr = self.last()? as *const T;
+		// Set the length first, in case `T::clone` panics.
+		// Safety: the element is moved out if the vector is unique or cloned if the vector is
+		//  shared. All elements within `len` remain valid.
+		unsafe {
+			self.set_len(self.len() - 1);
+		}
+
+		let element = if self.is_unique() {
+			// Safety: the element has already been removed from the vector above, so cannot be
+			//  aliased.
+			unsafe {
+				ptr.read()
+			}
+		} else {
+			// Safety: the element is valid, as it was part of the length before truncation and has
+			//  not been touched.
+			unsafe {
+				(*ptr).clone()
+			}
+		};
+		Some(element)
 	}
 
 	/// Removes and returns the last element from the vector if the predicate returns `true`, or
@@ -3181,8 +3672,34 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, 
 	/// # Time complexity
 	///
 	/// Takes *O*(1) time.
+	#[allow(clippy::multiple_unsafe_ops_per_block)]
 	pub fn pop_if<F: FnOnce(&mut T) -> bool>(&mut self, predicate: F) -> Option<T> {
-		todo!()
+		if self.is_empty() {
+			return None
+		}
+
+		let idx = self.len() - 1;
+		if self.is_unique() {
+			// Safety: elements within the length are valid.
+			unsafe {
+				let ptr = self.as_mut_ptr().add(idx);
+
+				predicate(&mut *ptr).then(|| {
+					let value = ptr.read();
+					self.set_len(idx);
+					value
+				})
+			}
+		} else {
+			let mut value = self[idx].clone();
+			predicate(&mut value).then(|| {
+				// Safety: elements within the length are valid.
+				unsafe {
+					self.set_len(idx);
+				}
+				value
+			})
+		}
 	}
 }
 
@@ -4120,7 +4637,7 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 	///
 	/// let mut vec: ArrayVec<i32, 8> = ArrayVec::from([1; 8]);
 	/// vec.fill_with(Default::default);
-	/// assert_eq!(vec, [0; 10]);
+	/// assert_eq!(vec, [0; 8]);
 	/// ```
 	pub fn fill_with<F>(&mut self, mut fill: F)
 	where
@@ -4133,9 +4650,17 @@ impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> ArrayVe
 
 			return
 		}
-		// Todo: if not empty, avoid cloning by creating a new vector and calling `extend`. Avoid
-		//  corruption on panic by tracking how many elements have been filled, and filling the rest
-		//  by cloning from the original on panic.
+		
+		let mut target = Self::new_in(self.allocator().clone());
+		
+		for _ in 0..self.len {
+			// Safety: `target` was just created, so must be unique.
+			unsafe {
+				target.inner.push_unchecked(&mut target.len, fill());
+			}
+		}
+		
+		*self = target;
 	}
 }
 
@@ -4151,8 +4676,21 @@ impl<T, const N: usize, A: Allocator + Clone, const ATOMIC: bool> Clone for Arra
 	/// Creates a new vector sharing its contents with this vector.
 	/// 
 	/// If the fixed capacity is `0`, both vectors remain unique.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use sharevec::array::vec::rc::ArrayVec;
+	///
+	/// let vec = ArrayVec::from([1, 2, 3]);
+	/// let clone = vec.clone();
+	///
+	/// // Both vectors are now shared.
+	/// assert!(vec.is_shared());
+	/// assert!(clone.is_shared());
+	/// ```
 	fn clone(&self) -> Self {
-		todo!()
+		Self { inner: self.inner.share::<ATOMIC>(), ..*self }
 	}
 }
 
@@ -4171,8 +4709,25 @@ impl<T, const N: usize, I: SliceIndex<[T]>, A: Allocator, const ATOMIC: bool> In
 }
 
 impl<T, const N: usize, const ATOMIC: bool> FromIterator<T> for ArrayVec<T, N, ATOMIC> {
+	/// Creates a new vector for an iterator.
+	///
+	/// # Panics
+	///
+	/// Panics if the iterator is yields more than elements than the fixed capacity can hold, or if
+	/// allocation fails, for example in an out-of-memory condition.
+	#[allow(clippy::panic)]
 	fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-		todo!()
+		let mut vec = Self::new();
+		match vec.try_extend(iter) {
+			Ok(()) => vec,
+			Err(TryExtendIter::Shared { .. }) =>
+				// Safety: a new vector is always unique.
+				unsafe {
+					core::hint::unreachable_unchecked()
+				},
+			Err(TryExtendIter::FullCapacity { .. }) =>
+				panic!("capacity overflow")
+		}
 	}
 }
 
@@ -4183,7 +4738,11 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> IntoIterator fo
 	/// Consumes the vector into an iterator yielding elements by value. If the vector is shared,
 	/// the elements are cloned out of the vector.
 	fn into_iter(self) -> Self::IntoIter {
-		todo!()
+		if self.is_unique() {
+			IntoIter::new_owned(self)
+		} else {
+			IntoIter::new_cloned(self)
+		}
 	}
 }
 
@@ -4209,34 +4768,24 @@ impl<'a, T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> Int
 }
 
 impl<T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> Extend<T> for ArrayVec<T, N, ATOMIC, A> {
+	#[allow(clippy::panic)]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-		todo!()
-	}
-
-	#[cfg(feature = "unstable-traits")]
-	fn extend_one(&mut self, item: T) {
-		todo!()
-	}
-
-	#[cfg(feature = "unstable-traits")]
-	fn extend_reserve(&mut self, additional: usize) {
-		todo!()
+		for elem in iter {
+			if self.push(elem).is_err() {
+				panic!("capacity overflowed");
+			}
+		}
 	}
 }
 
 impl<'a, T: Copy + 'a, const N: usize, A: Allocator + Clone, const ATOMIC: bool> Extend<&'a T> for ArrayVec<T, N, ATOMIC, A> {
+	#[allow(clippy::panic)]
 	fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
-		todo!()
-	}
-
-	#[cfg(feature = "unstable-traits")]
-	fn extend_one(&mut self, item: &'a T) {
-		todo!()
-	}
-
-	#[cfg(feature = "unstable-traits")]
-	fn extend_reserve(&mut self, additional: usize) {
-		todo!()
+		for elem in iter {
+			if self.push(*elem).is_err() {
+				panic!("capacity overflowed");
+			}
+		}
 	}
 }
 
@@ -4261,7 +4810,7 @@ impl<T: Ord, const N: usize, A: Allocator, const ATOMIC: bool> Ord for ArrayVec<
 
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Drop for ArrayVec<T, N, ATOMIC, A> {
 	fn drop(&mut self) {
-		todo!()
+		self.inner.drop_ref::<ATOMIC>(&mut self.len);
 	}
 }
 
@@ -4299,19 +4848,31 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> AsRef<[T]> for ArrayVe
 
 impl<T: Clone, const N: usize, const ATOMIC: bool> From<&[T; N]> for ArrayVec<T, N, ATOMIC> {
 	fn from(value: &[T; N]) -> Self {
-		todo!()
+		// Safety: the array contains exactly `N` elements, so cannot overflow the
+		//  vector.
+		unsafe {
+			Self::from_iter_trusted(value.iter().cloned())
+		}
 	}
 }
 
 impl<T: Clone, const N: usize, const ATOMIC: bool> From<&mut [T; N]> for ArrayVec<T, N, ATOMIC> {
 	fn from(value: &mut [T; N]) -> Self {
-		todo!()
+		// Safety: the array contains exactly `N` elements, so cannot overflow the
+		//  vector.
+		unsafe {
+			Self::from_iter_trusted(value.iter().cloned())
+		}
 	}
 }
 
 impl<T, const N: usize, const ATOMIC: bool> From<[T; N]> for ArrayVec<T, N, ATOMIC> {
 	fn from(value: [T; N]) -> Self {
-		todo!()
+		// Safety: the array contains exactly `N` elements, so cannot overflow the
+		//  vector.
+		unsafe {
+			Self::from_iter_trusted(value)
+		}
 	}
 }
 
@@ -4323,8 +4884,58 @@ impl<T: Clone, const N1: usize, const N2: usize, A: Allocator, const ATOMIC: boo
 	/// # Errors
 	/// 
 	/// Returns the vector back if its length is too large or small to fit in the array size.
+	#[allow(clippy::multiple_unsafe_ops_per_block)]
 	fn try_from(value: ArrayVec<T, N1, ATOMIC, A>) -> Result<Self, Self::Error> {
-		todo!()
+		if value.len() != N2 {
+			return Err(value)
+		}
+
+		struct DropGuard<T> {
+			ptr: *mut T,
+			len: usize
+		}
+
+		impl<T> Drop for DropGuard<T> {
+			fn drop(&mut self) {
+				// Safety: `len` elements have been initialized.
+				unsafe {
+					let slice = ptr::slice_from_raw_parts_mut(self.ptr, self.len);
+					self.len = 0;
+					ptr::drop_in_place(slice);
+				}
+			}
+		}
+
+		// Can't use an array of `MaybeUninit`s because there's no stable way to `assume_init`
+		// without copying.
+		let mut array = MaybeUninit::<[T; N2]>::uninit();
+		let ptr = array.as_mut_ptr().cast::<T>();
+
+		match value.try_into_iter() {
+			Ok(iter) => {
+				for (i, elem) in iter.enumerate() {
+					// Safety: initializing a `MaybeUninit`.
+					unsafe {
+						ptr.add(i).write(elem);
+					}
+				}
+			}
+			Err(vec) => {
+				// Drop already cloned elements if `T::clone` panics.
+				let DropGuard { len, .. } = &mut DropGuard { ptr, len: 0 };
+
+				for (i, elem) in vec.iter().enumerate() {
+					// Safety: initializing a `MaybeUninit`.
+					unsafe {
+						ptr.add(i).write(elem.clone());
+					}
+					*len += 1;
+				}
+			}
+		}
+
+		// Safety: all elements have been initialized.
+		Ok(unsafe { array.assume_init() })
 	}
 }
 
@@ -4332,7 +4943,14 @@ impl<T: Clone, const N: usize, const ATOMIC: bool> TryFrom<&[T]> for ArrayVec<T,
 	type Error = TryFromSlice<N>;
 
 	fn try_from(value: &[T]) -> Result<Self, TryFromSlice<N>> {
-		todo!()
+		if value.len() > N {
+			Err(TryFromSlice(value.len()))
+		} else {
+			// Safety: the slice length has been checked to not overflow the capacity.
+			Ok(unsafe {
+				Self::from_iter_trusted(value.iter().cloned())
+			})
+		}
 	}
 }
 
@@ -4340,7 +4958,14 @@ impl<T: Clone, const N: usize, const ATOMIC: bool> TryFrom<&mut [T]> for ArrayVe
 	type Error = TryFromSlice<N>;
 
 	fn try_from(value: &mut [T]) -> Result<Self, TryFromSlice<N>> {
-		todo!()
+		if value.len() > N {
+			Err(TryFromSlice(value.len()))
+		} else {
+			// Safety: the slice length has been checked to not overflow the capacity.
+			Ok(unsafe {
+				Self::from_iter_trusted(value.iter().cloned())
+			})
+		}
 	}
 }
 
@@ -4357,8 +4982,80 @@ impl<const N: usize, const ATOMIC: bool> TryFrom<&str> for ArrayVec<u8, N, ATOMI
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> TryFrom<StdVec<T, A>> for ArrayVec<T, N, ATOMIC, A> {
 	type Error = StdVec<T, A>;
 
-	fn try_from(value: StdVec<T, A>) -> Result<Self, StdVec<T, A>> {
-		todo!()
+	/// Creates a new vector from a [`Vec`](vec::Vec).
+	///
+	/// # Errors
+	///
+	/// Returns the [`Vec`](vec::Vec) back as an error if:
+	/// - the length is greater than the fixed capacity `N`
+	/// - the capacity is not equal to the fixed capacity `N`, and it failed to shrink or grow to
+	///   exactly this amount
+	#[allow(clippy::multiple_unsafe_ops_per_block)]
+	fn try_from(mut value: StdVec<T, A>) -> Result<Self, StdVec<T, A>> {
+		use alloc::alloc::handle_alloc_error;
+		use core::alloc::Layout;
+		use crate::raw::{check_size, VecInner};
+
+		let len = value.len();
+		if len > N {
+			return Err(value)
+		}
+
+		// Todo: shrink to N + 3 bytes to skip growing if the vector memory is larger
+		//  than N.
+
+		if let Some(additional) = N.checked_sub(value.capacity()) {
+			value.reserve_exact(additional);
+		} else {
+			value.shrink_to(N);
+		}
+
+		if value.capacity() != N {
+			return Err(value)
+		}
+
+		let new_layout = Layout::new::<VecInner<[T; N]>>();
+		if let Err(err) = check_size(new_layout.size()) {
+			err.handle();
+		}
+		// Todo: account for padding between the prefix and array?
+		let prefix_size = size_of::<VecInner>();
+
+		// Grow the allocation back by three `usize` words.
+		let (ptr, len, cap, alloc) = value.into_raw_parts_with_alloc();
+		// Safety: the pointer was returned by `Vec`, so must be non-null.
+		let ptr = unsafe {
+			NonNull::new_unchecked(ptr)
+		};
+		let old_layout = Layout::new::<[T; N]>();
+		// Safety: the pointer was allocated by `Vec` in the allocator with `old_layout`.
+		//  `new_layout` is larger than `old_layout`.
+		let Ok(ptr) = (unsafe {
+			alloc.grow(ptr.cast(), old_layout, new_layout)
+		}) else {
+			handle_alloc_error(new_layout);
+		};
+
+		// Safety: the allocation is large enough to shift the elements back by the prefix size. The
+		//  counts and length are initialized properly.
+		unsafe {
+			let byte_ptr = ptr.cast::<u8>().as_ptr();
+			let start_ptr = byte_ptr.add(prefix_size);
+			ptr::copy(
+				byte_ptr,
+				start_ptr,
+				size_of::<[T; N]>()
+			);
+
+			let inner_ptr = ptr.cast::<VecInner>();
+			VecInner::init_counts(inner_ptr);
+			VecInner::len(inner_ptr).as_ptr().write(N);
+
+			Ok(Self {
+				inner: RawVec::<[T; N], _>::from_raw_parts(start_ptr.cast(), alloc),
+				len,
+			})
+		}
 	}
 }
 
@@ -4385,15 +5082,57 @@ impl<T, const N: usize, const ATOMIC: bool> TryFrom<Box<[T]>> for ArrayVec<T, N,
 	type Error = Box<[T]>;
 
 	fn try_from(value: Box<[T]>) -> Result<Self, Box<[T]>> {
-		todo!()
+		let array_box = Box::<[T; N]>::try_from(value)?;
+		Ok(array_box.into())
 	}
 }
 
-impl<T, const N: usize, const ATOMIC: bool> TryFrom<Box<[T; N]>> for ArrayVec<T, N, ATOMIC> {
-	type Error = Box<[T; N]>;
+impl<T, const N: usize, const ATOMIC: bool> From<Box<[T; N]>> for ArrayVec<T, N, ATOMIC> {
+	#[allow(clippy::panic)]
+	#[allow(clippy::multiple_unsafe_ops_per_block)]
+	fn from(value: Box<[T; N]>) -> Self {
+		use alloc::alloc::handle_alloc_error;
+		use core::alloc::Layout;
+		use crate::raw::VecInner;
 
-	fn try_from(value: Box<[T; N]>) -> Result<Self, Box<[T; N]>> {
-		todo!()
+		let new_layout = Layout::new::<VecInner<[T; N]>>();
+		if let Err(err) = check_size(new_layout.size()) {
+			err.handle();
+		}
+		// Todo: account for padding between the prefix and array?
+		let prefix_size = size_of::<VecInner>();
+
+		// Grow the allocation back by three `usize` words.
+		let (ptr, alloc) = Box::into_non_null_with_allocator(value);
+		let old_layout = Layout::new::<[T; N]>();
+		// Safety: the pointer was allocated by `Box` in the allocator with `old_layout`.
+		//  `new_layout` is larger than `old_layout`.
+		let Ok(ptr) = (unsafe {
+			alloc.grow(ptr.cast(), old_layout, new_layout)
+		}) else {
+			handle_alloc_error(new_layout);
+		};
+
+		// Safety: the allocation is large enough to shift the elements back by the prefix size. The
+		//  counts and length are initialized properly.
+		unsafe {
+			let byte_ptr = ptr.cast::<u8>().as_ptr();
+			let start_ptr = byte_ptr.add(prefix_size);
+			ptr::copy(
+				byte_ptr,
+				start_ptr,
+				size_of::<[T; N]>()
+			);
+
+			let inner_ptr = ptr.cast::<VecInner>();
+			VecInner::init_counts(inner_ptr);
+			VecInner::len(inner_ptr).as_ptr().write(N);
+			
+			Self {
+				inner: RawVec::<[T; N], _>::from_raw_parts(start_ptr.cast(), alloc),
+				len: N,
+			}
+		}
 	}
 }
 
@@ -4407,7 +5146,7 @@ impl<const N: usize, const ATOMIC: bool> TryFrom<Box<str>> for ArrayVec<u8, N, A
 				// Safety: the string was just converted into bytes and returned
 				// back as an error unmodified.
 				unsafe {
-					core::mem::transmute(v)
+					mem::transmute(v)
 				}
 			)
 	}

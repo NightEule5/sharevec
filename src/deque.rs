@@ -55,10 +55,12 @@ mod __private {
 	use alloc::alloc::Global;
 	use core::alloc::Allocator;
 	use core::marker::PhantomData;
+	use crate::raw::RawDeque;
 
 	pub struct Deque<T, const ATOMIC: bool, A: Allocator = Global> {
-		_t: PhantomData<T>,
-		_a: PhantomData<A>
+		pub(crate) inner: RawDeque<[T], A>,
+		pub(crate) head: usize,
+		pub(crate) len: usize,
 	}
 }
 

@@ -6,8 +6,12 @@ use alloc::{
 	alloc::Global,
 	sync::Arc,
 };
+use alloc::rc::Rc;
 use core::alloc::Allocator;
+use core::mem::ManuallyDrop;
+use core::ptr;
 use core::ptr::NonNull;
+use crate::raw::RawVec;
 
 /// A contiguous, fixed-capacity array type, with heap-allocated, atomic reference-counted contents.
 /// Can be cheaply cloned in *O*(1) time, sharing its contents between clones. As a consequence,
@@ -224,7 +228,10 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	/// See the example at [`into_raw_parts_with_alloc`](Self::into_raw_parts_with_alloc#examples).
 	pub unsafe fn from_raw_parts_in(ptr: *mut T, length: usize, alloc: A) -> Self {
-		todo!()
+		Self {
+			inner: RawVec::<[_; N], _>::from_raw_parts(ptr, alloc),
+			len: length,
+		}
 	}
 
 	/// Creates a vector directly from a [`NonNull`] pointer, a length, and an allocator.
@@ -261,7 +268,10 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	/// See the example at [`into_parts_with_alloc`](Self::into_parts_with_alloc#examples).
 	pub unsafe fn from_parts_in(ptr: NonNull<T>, length: usize, alloc: A) -> Self {
-		todo!()
+		Self {
+			inner: RawVec::<[_; N], _>::from_non_null(ptr, alloc),
+			len: length,
+		}
 	}
 
 	/// Decomposes the vector into its raw components: pointer and length.
@@ -284,7 +294,7 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	/// ```
 	/// use sharevec::array::vec::arc::ArrayVec;
 	///
-	/// let vec = ArrayVec::from([-1, 0, 1]);
+	/// let vec = ArrayVec::from([1, 2, 3]);
 	/// let (ptr, len) = vec.into_raw_parts();
 	/// let rebuilt = unsafe {
 	///     // The pointer can be transmuted to a compatible type. Care must be
@@ -295,11 +305,12 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	///     ArrayVec::<u32, 3>::from_raw_parts(ptr, len)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_raw_parts(self) -> (*mut T, usize) {
-		todo!()
+		let (ptr, len, _) = self.into_raw_parts_with_alloc();
+		(ptr, len)
 	}
 
 	/// Decomposes the vector into its raw components: `NonNull` pointer and length.
@@ -333,11 +344,12 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	///     ArrayVec::<u32, 3>::from_parts(ptr, len)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_parts(self) -> (NonNull<T>, usize) {
-		todo!()
+		let (ptr, len, _) = self.into_parts_with_alloc();
+		(ptr, len)
 	}
 
 	/// Decomposes the vector into its raw components: pointer, length, and allocator.
@@ -371,11 +383,12 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	///     ArrayVec::<u32, 3>::from_raw_parts_in(ptr, len, alloc)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_raw_parts_with_alloc(self) -> (*mut T, usize, A) {
-		todo!()
+		let (ptr, len, alloc) = self.into_parts_with_alloc();
+		(ptr.as_ptr(), len, alloc)
 	}
 
 	/// Decomposes the vector into its raw components: `NonNull` pointer, length, and allocator.
@@ -409,11 +422,18 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	///     ArrayVec::<u32, 3>::from_parts_in(ptr, len, alloc)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_parts_with_alloc(self) -> (NonNull<T>, usize, A) {
-		todo!()
+		let mut this = ManuallyDrop::new(self);
+		let ptr = this.as_non_null();
+		let len = this.len();
+		// Safety: the allocator is moved out of `self`, and never touched again.
+		let alloc = unsafe {
+			ptr::read(this.inner.allocator())
+		};
+		(ptr, len, alloc)
 	}
 
 	/// Returns a weak reference to the allocation. This does not count toward strong sharing, but
@@ -431,17 +451,28 @@ impl<T, const N: usize, A: Allocator> ArrayVec<T, N, A> {
 	///
 	/// assert_eq!(vec.try_push(1), Ok(()));
 	/// ```
-	pub fn demote(&self) -> Weak<T, N, A> {
-		todo!()
+	pub fn demote(&self) -> Weak<T, N, A>
+	where
+		A: Clone
+	{
+		// Clone the allocator first, in case cloning panics. In this case, the
+		// weak count is not incremented.
+		let alloc = self.allocator().clone();
+		self.inner.weak_inc::<false>();
+		let ptr = self.inner.inner_ptr().cast();
+		Weak {
+			ptr,
+			alloc: ManuallyDrop::new(alloc),
+		}
 	}
 }
 
-impl<T, const N: usize, A: Allocator> Unique<'_, T, N, A> {
+impl<T, const N: usize, A: Allocator + Clone> Unique<'_, T, N, A> {
 	/// Consumes the reference, returning a weak reference to the allocation.
 	///
 	/// Equivalent to [`Arc::downgrade`].
 	pub fn demote(self) -> Weak<T, N, A> {
-		todo!()
+		self.vec.demote()
 	}
 }
 
@@ -471,7 +502,24 @@ impl<const N: usize, A: Allocator> TryFrom<Arc<str, A>> for ArrayVec<u8, N, A> {
 	type Error = Arc<str, A>;
 
 	fn try_from(value: Arc<str, A>) -> Result<Self, Arc<str, A>> {
-		todo!()
+		let len = value.len();
+		if len > N {
+			return Err(value)
+		}
+
+		// Can't use transmute to cast, as the compiler thinks the slices are
+		// different sizes.
+		let (ptr, alloc) = Arc::into_raw_with_allocator(value);
+		let byte_ptr = ptr::slice_from_raw_parts(ptr.cast(), len);
+		// Safety: the pointer was obtained from decomposing `value`. `str` and
+		//  `[u8]` slices are interchangeable.
+		let bytes = unsafe {
+			Arc::<[u8], A>::from_raw_in(byte_ptr, alloc)
+		};
+		// Safety: the length has already been checked.
+		Ok(unsafe {
+			bytes.try_into().unwrap_unchecked()
+		})
 	}
 }
 

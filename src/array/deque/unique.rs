@@ -1421,7 +1421,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, AT
 		todo!()
 	}
 
-	const fn as_inner_mut(&mut self) -> &mut ArrayDeque<T, N, ATOMIC, A> {
+	pub(crate) const fn as_inner_mut(&mut self) -> &mut ArrayDeque<T, N, ATOMIC, A> {
 		todo!()
 	}
 }

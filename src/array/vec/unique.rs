@@ -35,7 +35,7 @@ pub struct Unique<
 	A: Allocator + 'a,
 	const ATOMIC: bool
 > {
-	_ref: PhantomData<&'a mut ArrayVec<T, N, ATOMIC, A>>,
+	pub(super) vec: &'a mut ArrayVec<T, N, ATOMIC, A>,
 }
 
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, ATOMIC> {
@@ -240,7 +240,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, AT
 	///     }
 	///     unique.set_len(8);
 	/// }
-	/// assert_eq!(unique, [1, 2, 3, 4, 5, 6, 7, 8]);
+	/// assert_eq!(unique, [0, 1, 2, 3, 4, 5, 6, 7]);
 	/// ```
 	///
 	/// Due to the aliasing guarantee, this code is valid:
@@ -299,7 +299,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, AT
 	///     }
 	///     unique.set_len(8);
 	/// }
-	/// assert_eq!(unique, [1, 2, 3, 4, 5, 6, 7, 8]);
+	/// assert_eq!(unique, [0, 1, 2, 3, 4, 5, 6, 7]);
 	/// ```
 	///
 	/// Due to the aliasing guarantee, this code is valid:
@@ -612,7 +612,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, AT
 	///
 	/// let mut vec = ArrayVec::from([1, 2, 3, 4]);
 	/// let mut unique = vec.as_unique();
-	/// let even = |x: &mut i32| *x % 2 == 0;
+	/// let even = |x: &mut _| *x % 2 == 0;
 	/// assert_eq!(unique.pop_if(even), Some(4));
 	/// assert_eq!(unique, [1, 2, 3]);
 	/// assert_eq!(unique.pop_if(even), None);
@@ -622,7 +622,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, AT
 	///
 	/// Takes *O*(1) time.
 	pub fn pop_if<F: FnOnce(&mut T) -> bool>(&mut self, predicate: F) -> Option<T> {
-		todo!()
+		delegate!(self.try_pop_if(predicate) -> shared)
 	}
 
 	/// Moves all elements from `other` into this vector, leaving `other` empty. Any like[^atomic]
@@ -654,8 +654,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, AT
 	/// assert_eq!(vec2, []);
 	///
 	/// assert_eq!(unique.append(&mut vec3.as_unique()), Err(FullCapacity { remaining: 2 }));
-	/// assert_eq!(unique, [1, 2, 3, 4, 5, 6, 7]);
-	/// assert_eq!(vec3, [8, 9]);
+	/// assert_eq!(unique, [1, 2, 3, 4, 5, 6]);
+	/// assert_eq!(vec3, [7, 8, 9]);
 	/// ```
 	pub fn append<V: UniqueVector<T, A, ATOMIC> + ?Sized>(&mut self, other: &mut V) -> Result<(), FullCapacity> {
 		delegate!(self.try_append(other) -> extend)
@@ -987,11 +987,11 @@ impl<T: Clone, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N
 
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Unique<'_, T, N, A, ATOMIC> {
 	const fn as_inner(&self) -> &ArrayVec<T, N, ATOMIC, A> {
-		todo!()
+		&*self.vec
 	}
 
-	const fn as_inner_mut(&mut self) -> &mut ArrayVec<T, N, ATOMIC, A> {
-		todo!()
+	pub(crate) const fn as_inner_mut(&mut self) -> &mut ArrayVec<T, N, ATOMIC, A> {
+		self.vec
 	}
 }
 
@@ -1070,17 +1070,18 @@ impl<'a, T: Clone, const N: usize, A: Allocator + Clone, const ATOMIC: bool> Int
 }
 
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Extend<T> for Unique<'_, T, N, A, ATOMIC> {
+	#[allow(clippy::panic)]
 	fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-		if let Err(_) = delegate!(self.try_extend(iter) -> extend_iter) {
-			todo!("capacity panic")
-		}
+		let Ok(()) = delegate!(self.try_extend(iter) -> extend_iter) else {
+			panic!("capacity overflow");
+		};
 	}
 
+	#[allow(clippy::panic)]
 	#[cfg(feature = "unstable-traits")]
-	#[track_caller]
 	fn extend_one(&mut self, item: T) {
 		let Ok(()) = self.push(item) else {
-			todo!("capacity panic")
+			panic!("capacity overflow");
 		};
 	}
 
@@ -1089,16 +1090,20 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Extend<T> for Unique<'
 }
 
 impl<'a, T: Copy + 'a, const N: usize, A: Allocator, const ATOMIC: bool> Extend<&'a T> for Unique<'_, T, N, A, ATOMIC> {
+	#[allow(clippy::panic)]
 	fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
-		if let Err(_) = delegate!(self.try_extend_ref(iter) -> extend_iter) {
-			todo!("capacity panic")
-		}
+		let Ok(()) = delegate!(self.try_extend_ref(iter) -> extend_iter) else {
+			panic!("capacity overflow");
+		};
 	}
 
+	#[allow(clippy::panic)]
 	#[cfg(feature = "unstable-traits")]
 	#[track_caller]
 	fn extend_one(&mut self, item: &'a T) {
-		self.extend_one(*item);
+		let Ok(()) = self.push(*item) else {
+			panic!("capacity overflow");
+		};
 	}
 
 	#[cfg(feature = "unstable-traits")]
