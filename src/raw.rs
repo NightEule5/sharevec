@@ -347,16 +347,13 @@ impl<T, I: InnerBase, A: Allocator> RawCollection<[T], I, A> {
 	}
 
 	pub unsafe fn from_raw_parts(ptr: *mut T, cap: usize, alloc: A) -> Self {
-		Self {
-			inner: RawInnerVec::from_raw_parts(ptr.cast(), alloc),
-			cap,
-			_i: PhantomData
-		}
+		Self::from_non_null(NonNull::new_unchecked(ptr), cap, alloc)
 	}
 
 	pub unsafe fn from_non_null(ptr: NonNull<T>, cap: usize, alloc: A) -> Self {
+		let ptr = I::from_store(ptr.cast()).cast();
 		Self {
-			inner: RawInnerVec::from_non_null(ptr.cast(), alloc),
+			inner: RawInnerVec::from_non_null(ptr, alloc),
 			cap,
 			_i: PhantomData
 		}
@@ -370,7 +367,7 @@ where
 	#[track_caller]
 	pub fn new(alloc: A) -> Self {
 		match Self::try_new(alloc) {
-			Ok(v) => v.init(),
+			Ok(v) => v,
 			Err(e) => e.handle()
 		}
 	}
@@ -390,16 +387,13 @@ where
 	}
 
 	pub unsafe fn from_raw_parts(ptr: *mut T, alloc: A) -> Self {
-		Self {
-			inner: RawInnerVec::from_raw_parts(ptr.cast(), alloc),
-			cap: (),
-			_i: PhantomData
-		}
+		Self::from_non_null(NonNull::new_unchecked(ptr), alloc)
 	}
 
 	pub unsafe fn from_non_null(ptr: NonNull<T>, alloc: A) -> Self {
+		let ptr = I::from_store(ptr.cast()).cast();
 		Self {
-			inner: RawInnerVec::from_non_null(ptr.cast(), alloc),
+			inner: RawInnerVec::from_non_null(ptr, alloc),
 			cap: (),
 			_i: PhantomData
 		}

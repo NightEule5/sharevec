@@ -88,6 +88,7 @@ impl<A: Allocator> RawInnerVec<A> {
 	}
 
 	pub unsafe fn from_non_null(ptr: NonNull<u8>, alloc: A) -> Self {
+		
 		Self {
 			ptr: InnerVecPtr::Allocated { ptr },
 			alloc,
@@ -166,7 +167,7 @@ impl<A: Allocator> RawInnerVec<A> {
 					let store_size = elem_layout.size().wrapping_mul(cap);
 					let store_layout = Layout::from_size_align_unchecked(store_size, elem_layout.align());
 					let (layout, elem_offset) = base_layout.extend(store_layout).unwrap_unchecked();
-					Some((ptr, layout, elem_offset))
+					Some((ptr, layout.pad_to_align(), elem_offset))
 				}
 		}
 	}

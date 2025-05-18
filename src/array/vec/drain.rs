@@ -105,11 +105,11 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Drop for Drain<'_, T, 
 	fn drop(&mut self) {
 		let tail = self.tail.clone();
 		let iter = mem::take(&mut self.iter);
-		let vec = NonNull::from(self.raw_vec());
-		// Safety: the pointer is valid for reads and writes (non-dangling).
-		let head_len = unsafe {
-			&mut self.vec.as_mut().len
+		// Safety: the pointer value is valid, and the reference is tied to a valid lifetime.
+		let ArrayVec { inner: vec, len: head_len } = unsafe {
+			self.vec.as_mut()
 		};
+
 		match self.mode {
 			Mode::Unique => drop_unique(tail, iter, vec, head_len),
 			Mode::Cloning => drop_clone::<_, N, _, ATOMIC>(tail, vec, head_len)
@@ -165,7 +165,7 @@ fn move_or_clone<T>(mode: Mode, v: &T) -> T {
 fn drop_unique<T, const N: usize, A: Allocator>(
 	tail: Range<usize>,
 	iter: Iter<T>,
-	mut vec: NonNull<RawVec<[T; N], A>>,
+	vec: &mut RawVec<[T; N], A>,
 	len: &mut usize,
 ) {
 	let old_len = *len;
@@ -175,7 +175,6 @@ fn drop_unique<T, const N: usize, A: Allocator>(
 		// ZSTs are interchangeable; we only need to drop the correct amount. This can be done by
 		// manipulating the vector's length instead of move them out of `iter`.
 		unsafe {
-			let vec = vec.as_mut();
 			vec.set_len(len, old_len + drop_len + tail.len());
 			vec.truncate(old_len + tail.len());
 		}
@@ -185,7 +184,7 @@ fn drop_unique<T, const N: usize, A: Allocator>(
 
 	struct DropGuard<'a, T, const N: usize, A: Allocator> {
 		tail: Range<usize>,
-		vec: NonNull<RawVec<[T; N], A>>,
+		vec: &'a mut RawVec<[T; N], A>,
 		len: &'a mut usize,
 	}
 
@@ -194,7 +193,6 @@ fn drop_unique<T, const N: usize, A: Allocator>(
 			let Self { tail, vec, len } = self;
 			if tail.len() > 0 {
 				unsafe {
-					let vec = vec.as_mut();
 					let start = **len;
 					let tail_start = tail.start;
 					if tail_start != start {
@@ -210,7 +208,7 @@ fn drop_unique<T, const N: usize, A: Allocator>(
 	}
 
 	// Moves elements back to fill the dropped area, even if `ptr::drop_in_place` panics.
-	let _guard = DropGuard { tail, vec, len };
+	let guard = DropGuard { tail, vec, len };
 
 	let drop_ptr = iter.as_slice().as_ptr();
 
@@ -218,7 +216,7 @@ fn drop_unique<T, const N: usize, A: Allocator>(
 		// `drop_ptr` comes from an immutable reference, but `ptr::drop_in_place` needs a pointer
 		// valid for writes. We must reconstruct the pointer from the original vector, but avoid
 		// creating a mutable reference to the front, as this would invalidate existing raw pointers.
-		let vec_ptr = vec.as_mut().ptr().as_ptr();
+		let vec_ptr = guard.vec.ptr().as_ptr();
 		let drop_offset = drop_ptr.offset_from_unsigned(vec_ptr);
 		let drop_slice = ptr::slice_from_raw_parts_mut(vec_ptr.add(drop_offset), drop_len);
 		ptr::drop_in_place(drop_slice);
@@ -229,7 +227,7 @@ fn drop_unique<T, const N: usize, A: Allocator>(
 /// a new allocation, or setting the length if the tail is empty.
 fn drop_clone<T, const N: usize, A: Allocator, const ATOMIC: bool>(
 	tail: Range<usize>,
-	mut vec_ptr: NonNull<RawVec<[T; N], A>>,
+	vec: &mut RawVec<[T; N], A>,
 	len: &mut usize,
 ) {
 	struct AllocGuard<'alloc, T, const N: usize, A: Allocator> {
@@ -247,8 +245,6 @@ fn drop_clone<T, const N: usize, A: Allocator, const ATOMIC: bool>(
 	if tail.is_empty() {
 		return
 	}
-
-	let vec = unsafe { vec_ptr.as_ref() };
 
 	let alloc = vec.allocator();
 	let dst = RawVec::<[T; N], &A>::new(alloc);
@@ -280,13 +276,13 @@ fn drop_clone<T, const N: usize, A: Allocator, const ATOMIC: bool>(
 
 	// No more risk of panicking, disarm the guard so we don't accidentally deallocate.
 	let dst = ManuallyDrop::new(dst);
+	let new_ptr = dst.vec.inner_ptr();
 	
 	unsafe {
-		let vec = vec_ptr.as_mut();
 		// Deallocate the source reference.
 		vec.drop_ref::<ATOMIC>(len);
 		// Replace the reference with the target allocation.
-		vec.set_ptr(dst.vec.inner_ptr().cast());
+		vec.set_ptr(new_ptr.cast());
 		vec.set_len(len, head_len + tail_len);
 	}
 }
