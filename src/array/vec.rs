@@ -502,7 +502,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// assert_eq!(vec.weak_count(), 1);
 	/// ```
 	pub fn weak_count(&self) -> usize {
-		self.inner.weak_count::<ATOMIC>().unwrap_or(1)
+		self.inner.weak_count::<ATOMIC>().unwrap_or(0)
 	}
 
 	/// If the vector is unique, returns a mutable view of the unique allocation.
