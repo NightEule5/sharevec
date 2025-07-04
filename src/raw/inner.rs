@@ -28,6 +28,11 @@ enum InnerVecPtr {
 	}
 }
 
+pub enum AllocState {
+	Initialized,
+	Uninitialized
+}
+
 impl<A: Allocator + Clone> Clone for RawInnerVec<A> {
 	fn clone(&self) -> Self {
 		Self {
@@ -61,11 +66,11 @@ impl<A: Allocator> RawInnerVec<A> {
 		base_layout: Layout,
 		elem_layout: Layout,
 	) -> Result<Self, AllocError> {
-		if cap == 0 {
+		if cap == 0 || elem_layout.size() == 0 {
 			return Ok(Self::dangling(alloc))
 		}
 		
-		let layout = inner_layout(base_layout, elem_layout, cap)?;
+		let (layout, _) = inner_layout(base_layout, elem_layout, cap)?;
 		Self::allocate(layout, alloc)
 	}
 
@@ -153,7 +158,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		NonNull::from_raw_parts(ptr, length)
 	}
 
-	pub fn allocator(&self) -> &A {
+	pub const fn allocator(&self) -> &A {
 		&self.alloc
 	}
 	
@@ -167,7 +172,7 @@ impl<A: Allocator> RawInnerVec<A> {
 					let store_size = elem_layout.size().wrapping_mul(cap);
 					let store_layout = Layout::from_size_align_unchecked(store_size, elem_layout.align());
 					let (layout, elem_offset) = base_layout.extend(store_layout).unwrap_unchecked();
-					Some((ptr, layout.pad_to_align(), elem_offset))
+					Some((ptr, layout, elem_offset))
 				}
 		}
 	}
@@ -180,7 +185,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		additional: usize,
 		base_layout: Layout,
 		elem_layout: Layout,
-	) {
+	) -> Option<AllocState> {
 		#[cold]
 		#[track_caller]
 		fn reserve<A: Allocator>(
@@ -190,14 +195,15 @@ impl<A: Allocator> RawInnerVec<A> {
 			additional: usize,
 			base_layout: Layout,
 			elem_layout: Layout,
-		) {
-			if let Err(err) = this.grow_amortized(len, cap, additional, base_layout, elem_layout) {
-				err.handle();
+		) -> AllocState {
+			match this.grow_amortized(len, cap, additional, base_layout, elem_layout) {
+				Ok(state) => state,
+				Err(err) => err.handle()
 			}
 		}
 		
 		if self.must_grow(len, *cap, additional, elem_layout) {
-			reserve(self, len, cap, additional, base_layout, elem_layout);
+			return Some(reserve(self, len, cap, additional, base_layout, elem_layout));
 		}
 
 		// Safety: this condition was checked above.
@@ -206,6 +212,8 @@ impl<A: Allocator> RawInnerVec<A> {
 			// additional elements.
 			hint::assert_unchecked(!self.must_grow(len, *cap, additional, elem_layout));
 		}
+		
+		None
 	}
 	
 	pub fn try_reserve(
@@ -215,9 +223,9 @@ impl<A: Allocator> RawInnerVec<A> {
 		additional: usize,
 		base_layout: Layout,
 		elem_layout: Layout,
-	) -> Result<(), AllocError> {
+	) -> Result<Option<AllocState>, AllocError> {
 		if self.must_grow(len, *cap, additional, elem_layout) {
-			self.grow_amortized(len, cap, additional, base_layout, elem_layout)?;
+			return self.grow_amortized(len, cap, additional, base_layout, elem_layout).map(Some);
 		}
 		
 		// Safety: this condition was checked above.
@@ -226,7 +234,7 @@ impl<A: Allocator> RawInnerVec<A> {
 			// additional elements.
 			hint::assert_unchecked(!self.must_grow(len, *cap, additional, elem_layout));
 		}
-		Ok(())
+		Ok(None)
 	}
 	
 	#[track_caller]
@@ -237,7 +245,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		additional: usize,
 		base_layout: Layout,
 		elem_layout: Layout,
-	) {
+	) -> Option<AllocState> {
 		#[cold]
 		#[track_caller]
 		pub fn reserve_exact<A: Allocator>(
@@ -247,14 +255,15 @@ impl<A: Allocator> RawInnerVec<A> {
 			additional: usize,
 			base_layout: Layout,
 			elem_layout: Layout,
-		) {
-			if let Err(err) = this.grow_exact(len, cap, additional, base_layout, elem_layout) {
-				err.handle();
+		) -> AllocState {
+			match this.grow_exact(len, cap, additional, base_layout, elem_layout) {
+				Ok(state) => state,
+				Err(err) => err.handle()
 			}
 		}
 		
 		if self.must_grow(len, *cap, additional, elem_layout) {
-			reserve_exact(self, len, cap, additional, base_layout, elem_layout);
+			return Some(reserve_exact(self, len, cap, additional, base_layout, elem_layout));
 		}
 
 		// Safety: this condition was checked above.
@@ -263,6 +272,8 @@ impl<A: Allocator> RawInnerVec<A> {
 			// additional elements.
 			hint::assert_unchecked(!self.must_grow(len, *cap, additional, elem_layout));
 		}
+		
+		None
 	}
 
 	pub fn try_reserve_exact(
@@ -272,9 +283,9 @@ impl<A: Allocator> RawInnerVec<A> {
 		additional: usize,
 		base_layout: Layout,
 		elem_layout: Layout,
-	) -> Result<(), AllocError> {
+	) -> Result<Option<AllocState>, AllocError> {
 		if self.must_grow(len, *cap, additional, elem_layout) {
-			self.grow_exact(len, cap, additional, base_layout, elem_layout)?;
+			return self.grow_exact(len, cap, additional, base_layout, elem_layout).map(Some);
 		}
 
 		// Safety: this condition was checked above.
@@ -283,7 +294,7 @@ impl<A: Allocator> RawInnerVec<A> {
 			// additional elements.
 			hint::assert_unchecked(!self.must_grow(len, *cap, additional, elem_layout));
 		}
-		Ok(())
+		Ok(None)
 	}
 	
 	fn must_grow(&self, len: usize, cap: usize, additional: usize, elem_layout: Layout) -> bool {
@@ -307,7 +318,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		additional: usize,
 		base_layout: Layout,
 		elem_layout: Layout
-	) -> Result<(), AllocError> {
+	) -> Result<AllocState, AllocError> {
 		if elem_layout.size() == 0 {
 			// Since we return a capacity of `usize::MAX` when the element size is
 			// zero, getting here means the vector is overfull.
@@ -320,9 +331,8 @@ impl<A: Allocator> RawInnerVec<A> {
 		let cap = cmp::max(*cur_cap * 2, required);
 		let cap = cmp::max(min_non_zero_cap(elem_layout.size()), cap);
 		
-		let new_layout = inner_layout(base_layout, elem_layout, cap)?;
-		
-		let ptr = finish_grow(
+		let (new_layout, _) = inner_layout(base_layout, elem_layout, cap)?;
+		let (state, ptr) = finish_grow(
 			new_layout,
 			self.current_memory(*cur_cap, base_layout, elem_layout),
 			self.allocator()
@@ -332,7 +342,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		unsafe {
 			self.set_ptr_and_cap(ptr, cur_cap, elem_layout.size());
 		}
-		Ok(())
+		Ok(state)
 	}
 
 	fn grow_exact(
@@ -342,7 +352,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		additional: usize,
 		base_layout: Layout,
 		elem_layout: Layout
-	) -> Result<(), AllocError> {
+	) -> Result<AllocState, AllocError> {
 		if elem_layout.size() == 0 {
 			// Since we return a capacity of `usize::MAX` when the element size is
 			// zero, getting here means the vector is overfull.
@@ -351,9 +361,9 @@ impl<A: Allocator> RawInnerVec<A> {
 
 		let cap = len.checked_add(additional).ok_or(AllocError::CapacityOverflow)?;
 		
-		let new_layout = inner_layout(base_layout, elem_layout, cap)?;
+		let (new_layout, _) = inner_layout(base_layout, elem_layout, cap)?;
 
-		let ptr = finish_grow(
+		let (state, ptr) = finish_grow(
 			new_layout,
 			self.current_memory(*cur_cap, base_layout, elem_layout),
 			self.allocator()
@@ -363,7 +373,7 @@ impl<A: Allocator> RawInnerVec<A> {
 		unsafe {
 			self.set_ptr_and_cap(ptr, cur_cap, elem_layout.size());
 		}
-		Ok(())
+		Ok(state)
 	}
 	
 	#[track_caller]
@@ -474,11 +484,10 @@ const fn min_non_zero_cap(size: usize) -> usize {
 	}
 }
 
-fn inner_layout(base: Layout, elem: Layout, cap: usize) -> Result<Layout, AllocError> {
+pub fn inner_layout(base: Layout, elem: Layout, cap: usize) -> Result<(Layout, usize), AllocError> {
 	let store_size = elem.size().checked_mul(cap).ok_or(AllocError::CapacityOverflow)?;
 	let store_layout = Layout::from_size_align(store_size, elem.align())?;
-	let (layout, _) = base.extend(store_layout)?;
-	Ok(layout)
+	Ok(base.extend(store_layout)?)
 }
 
 #[cold]
@@ -486,7 +495,7 @@ fn finish_grow<A: Allocator>(
 	new_layout: Layout,
 	current_memory: Option<(NonNull<u8>, Layout, usize)>,
 	alloc: &A
-) -> Result<NonNull<[u8]>, AllocError> {
+) -> Result<(AllocState, NonNull<[u8]>), AllocError> {
 	check_size(new_layout.size())?;
 	
 	let memory = match current_memory {
@@ -494,10 +503,10 @@ fn finish_grow<A: Allocator>(
 			// Safety: `ptr` points to memory currently allocated in `alloc` with `old_layout`. The
 			//  size of `new_layout` is strictly greater than that of `old_layout`.
 			unsafe {
-				alloc.grow(ptr, old_layout, new_layout)
+				alloc.grow(ptr, old_layout, new_layout).map(|ptr| (AllocState::Initialized, ptr))
 			}
 		}
-		None => alloc.allocate(new_layout)
+		None => alloc.allocate(new_layout).map(|ptr| (AllocState::Uninitialized, ptr))
 	};
 	
 	memory.map_err(|_| AllocError::Alloc { layout: new_layout })

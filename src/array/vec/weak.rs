@@ -320,6 +320,10 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Weak<T, N, A, ATOMIC> 
 
 	/// Returns the maximum length of the vector. 
 	pub fn len(&self) -> usize {
+		if is_dangling(self.ptr) {
+			return 0
+		}
+		
 		// Safety: the memory is always valid, as existence of a weak reference prevents it from
 		//  being deallocated.
 		unsafe {
@@ -423,7 +427,18 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Weak<T, N, A, ATOMIC> 
 	/// ```
 	#[cfg(feature = "vec")]
 	pub fn into_weak_vec(self) -> VecWeak<T, A, ATOMIC> {
-		todo!()
+		let md = ManuallyDrop::new(self);
+		// Safety: the weak pointer's dropper has already been disabled, so this
+		//  will not be accessed again.
+		let alloc = unsafe {
+			(&raw const md.alloc).read()
+		};
+		VecWeak {
+			ptr: md.ptr.cast(),
+			_t: PhantomData,
+			cap: N,
+			alloc,
+		}
 	}
 }
 

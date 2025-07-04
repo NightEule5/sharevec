@@ -15,7 +15,7 @@ use crate::marker::UniqueVector;
 use crate::vec::{Vec, Drain};
 
 pub struct Unique<'a, T: 'a, A: Allocator + 'a, const ATOMIC: bool> {
-	_ref: PhantomData<&'a mut Vec<T, ATOMIC, A>>
+	pub(crate) vec: &'a mut Vec<T, ATOMIC, A>
 }
 
 impl<T, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
@@ -181,7 +181,7 @@ impl<T, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
 	///     }
 	///     unique.set_len(size);
 	/// }
-	/// assert_eq!(unique, [1, 2, 3, 4, 5, 6, 7, 8]);
+	/// assert_eq!(unique, [0, 1, 2, 3, 4, 5, 6, 7]);
 	/// ```
 	///
 	/// Due to the aliasing guarantee, this code is valid:
@@ -242,7 +242,7 @@ impl<T, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
 	///     }
 	///     unique.set_len(size);
 	/// }
-	/// assert_eq!(unique, [1, 2, 3, 4, 5, 6, 7, 8]);
+	/// assert_eq!(unique, [0, 1, 2, 3, 4, 5, 6, 7]);
 	/// ```
 	///
 	/// Due to the aliasing guarantee, this code is valid:
@@ -663,7 +663,7 @@ impl<T, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
 	///
 	/// Takes *O*(1) time.
 	pub fn pop_if<F: FnOnce(&mut T) -> bool>(&mut self, predicate: F) -> Option<T> {
-		todo!()
+		delegate!(self.try_pop_if(predicate) -> shared)
 	}
 
 	/// Moves all elements from `other` into this vector, leaving `other` empty. Any like[^atomic]
@@ -929,7 +929,7 @@ impl<T: Clone, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
 	/// let mut vec = Vec::new();
 	/// let mut unique = vec.as_unique();
 	/// unique.extend_from_slice(&[1, 2, 3]);
-	/// assert_eq!(unique, [1, 2, 3, 4]);
+	/// assert_eq!(unique, [1, 2, 3]);
 	/// ```
 	pub fn extend_from_slice(&mut self, other: &[T]) {
 		delegate!(self.try_extend_from_slice(other) -> shared)
@@ -978,11 +978,11 @@ impl<T: Clone, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
 
 impl<T, A: Allocator, const ATOMIC: bool> Unique<'_, T, A, ATOMIC> {
 	const fn as_inner(&self) -> &Vec<T, ATOMIC, A> {
-		todo!()
+		self.vec
 	}
 
 	pub(crate) const fn as_inner_mut(&mut self) -> &mut Vec<T, ATOMIC, A> {
-		todo!()
+		self.vec
 	}
 }
 
@@ -1020,6 +1020,7 @@ impl<T, I: SliceIndex<[T]>, A: Allocator, const ATOMIC: bool> Index<I> for Uniqu
 	}
 }
 
+#[cfg(feature = "unstable-traits")]
 impl<T, I: SliceIndex<[T]>, A: Allocator, const ATOMIC: bool> IndexMut<I> for Unique<'_, T, A, ATOMIC> {
 	fn index_mut(&mut self, index: I) -> &mut Self::Output {
 		delegate!(self.try_index_mut(index) -> shared)

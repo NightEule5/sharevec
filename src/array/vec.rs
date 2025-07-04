@@ -414,7 +414,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	}
 
 	/// Returns a reference to the underlying allocator.
-	pub fn allocator(&self) -> &A {
+	pub const fn allocator(&self) -> &A {
 		self.inner.allocator()
 	}
 
@@ -1418,7 +1418,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ArrayVec<T, N, ATOMIC,
 	/// let mut vec: ArrayVec<i32, 3> = ArrayVec::from([1, 2, 3]);
 	///
 	/// for i in 0..vec.len() {
-	///     *vec.try_index_mut(i).unwrap() = i as i32 * 2;
+	///     *vec.try_index_mut(i).unwrap() *= 2;
 	/// }
 	/// assert_eq!(vec, [2, 4, 6]);
 	/// 
@@ -5150,4 +5150,14 @@ impl<const N: usize, const ATOMIC: bool> TryFrom<Box<str>> for ArrayVec<u8, N, A
 				}
 			)
 	}
+}
+
+#[test]
+fn unique_weak_copy_out_regression() {
+	let mut vec = rc::ArrayVec::from([1, 2, 3]);
+	let weak = vec.demote();
+	vec.unique();
+
+	assert_eq!(vec.weak_count(), 0);
+	assert_eq!(vec, [1, 2, 3]);
 }

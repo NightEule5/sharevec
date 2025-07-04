@@ -70,6 +70,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Drain<'_, T, N, A, ATO
 	pub fn allocator(&self) -> &A {
 		self.raw_vec().allocator()
 	}
+
+	// Todo: add keep_rest?
 }
 	
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> AsRef<[T]> for Drain<'_, T, N, A, ATOMIC> {

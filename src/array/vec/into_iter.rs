@@ -164,15 +164,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Iterator for IntoIter<
 	}
 	
 	fn size_hint(&self) -> (usize, Option<usize>) {
-		// Can't use offset_from_unsigned for non-zst as it was stabilized too
-		// recently.
-		let byte_offset = (self.end as usize).wrapping_sub(self.ptr.as_ptr() as usize);
-		let len = if T::IS_ZST {
-			byte_offset
-		} else {
-			// Can't use offset_from_unsigned as it was stabilized too recently.
-			byte_offset / size_of::<T>()
-		};
+		let len = self.len();
 		(len, Some(len))
 	}
 	
@@ -212,7 +204,7 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Iterator for IntoIter<
 		R: Try<Output = B>,
 	{
 		if T::IS_ZST {
-			while self.is_at_end() {
+			while !self.is_at_end() {
 				// Safety: we just checked that `self.ptr` is in bounds.
 				let tmp = unsafe { self.ptr.read() };
 				// See `next` for why we subtract from `end` here.
@@ -221,11 +213,11 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Iterator for IntoIter<
 			}
 		} else {
 			// Safety: `self.end` can only be null if `T` is a ZST.
-			while self.is_at_end() {
+			while !self.is_at_end() {
 				// Safety: we just checked that `self.ptr` is in bounds.
 				let tmp = unsafe { self.ptr.read() };
+				// Increment `self.ptr` first to avoid double dropping in the event of a panic.
 				// Safety: the maximum this can be is `self.end`.
-				//  Increment `self.ptr` first to avoid double dropping in the event of a panic.
 				self.ptr = unsafe { self.ptr.add(1) };
 				init = f(init, tmp)?;
 			}
@@ -251,8 +243,8 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Iterator for IntoIter<
 			while self.is_at_end() {
 				// Safety: we just checked that `self.ptr` is in bounds.
 				let tmp = unsafe { self.ptr.read() };
+				// Increment `self.ptr` first to avoid double dropping in the event of a panic.
 				// Safety: the maximum this can be is `self.end`.
-				//  Increment `self.ptr` first to avoid double dropping in the event of a panic.
 				self.ptr = unsafe { self.ptr.add(1) };
 				init = f(init, tmp);
 			}
@@ -324,7 +316,19 @@ impl<T, const N: usize, A: Allocator, const ATOMIC: bool> DoubleEndedIterator fo
 	}
 }
 	
-impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ExactSizeIterator for IntoIter<T, N, A, ATOMIC> { }
+impl<T, const N: usize, A: Allocator, const ATOMIC: bool> ExactSizeIterator for IntoIter<T, N, A, ATOMIC> {
+	fn len(&self) -> usize {
+		// Can't use offset_from_unsigned for non-zst as it was stabilized too
+		// recently.
+		let byte_offset = (self.end as usize).wrapping_sub(self.ptr.as_ptr() as usize);
+		if T::IS_ZST {
+			byte_offset
+		} else {
+			// Can't use offset_from_unsigned as it was stabilized too recently.
+			byte_offset / size_of::<T>()
+		}
+	}
+}
 	
 #[cfg(feature = "unstable-traits")]
 // Safety: this iterator always returns the number of elements given by size_hint.
@@ -332,6 +336,8 @@ unsafe impl<T, const N: usize, A: Allocator, const ATOMIC: bool> TrustedLen for 
 	
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> FusedIterator for IntoIter<T, N, A, ATOMIC> { }
 	
+// Todo: clone implementation?
+
 impl<T, const N: usize, A: Allocator, const ATOMIC: bool> Drop for IntoIter<T, N, A, ATOMIC> {
 	fn drop(&mut self) {
 		use core::alloc::Layout;

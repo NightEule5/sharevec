@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use inner::RawInnerVec;
 use crate::error::Shared;
 use crate::marker::private::Vec as VecTrait;
+use crate::raw::inner::AllocState;
 
 pub mod inner;
 
@@ -116,6 +117,14 @@ pub trait InnerBase: Sized {
 	/// The pointer must be valid for dereferencing.
 	unsafe fn weak_dec<const ATOMIC: bool>(ptr: NonNull<Self>) -> usize {
 		dec_count::<ATOMIC>(Self::weak(ptr))
+	}
+	
+	fn layout<T>(cap: usize) -> Result<(Layout, usize), AllocError> {
+		inner::inner_layout(
+			Layout::new::<Self>(),
+			Layout::new::<T>(),
+			cap
+		)
 	}
 }
 
@@ -296,7 +305,7 @@ pub type RawVec  <S: ?Sized, A> = RawCollection<S,   VecInner, A>;
 
 pub struct RawCollection<S: ?Sized + Store, I, A> {
 	inner: RawInnerVec<A>,
-	cap: S::Capacity,
+	pub cap: S::Capacity,
 	_i: PhantomData<I>,
 }
 
@@ -323,6 +332,11 @@ impl<T, const N: usize, I, A: Allocator> RawCollection<[T; N], I, A> {
 impl<T, I: InnerBase, A: Allocator> RawCollection<[T], I, A> {
 	#[track_caller]
 	pub fn with_capacity(cap: usize, alloc: A) -> Self {
+		let cap = if size_of::<T>() == 0 {
+			usize::MAX
+		} else {
+			cap
+		};
 		Self {
 			inner: RawInnerVec::with_capacity(
 				cap,
@@ -336,6 +350,11 @@ impl<T, I: InnerBase, A: Allocator> RawCollection<[T], I, A> {
 	}
 
 	pub fn try_with_capacity(cap: usize, alloc: A) -> Result<Self, AllocError> {
+		let cap = if size_of::<T>() == 0 {
+			usize::MAX
+		} else {
+			cap
+		};
 		RawInnerVec::try_with_capacity(
 			cap,
 			alloc,
@@ -401,13 +420,22 @@ where
 }
 
 impl<S: ?Sized + Store, I: InnerBase, A: Allocator> RawCollection<S, I, A> {
-	fn init(self) -> Self {
+	fn init(mut self) -> Self {
+		if self.is_dangling() {
+			return self
+		}
+		
+		self.init_allocated();
+		self
+	}
+	
+	fn init_allocated(&mut self) {
 		let inner = self.inner.inner_ptr::<I>();
-		// Safety: `init` is only called when the vector is created.
+		// Safety: `init_allocated` is only called immediately after the vector
+		//  allocates new memory.
 		unsafe {
 			I::init_counts(inner);
 		}
-		self
 	}
 }
 
@@ -461,7 +489,21 @@ impl<T, const N: usize, I: InnerBase, A: Allocator> RawCollection<[T; N], I, A> 
 	}
 }
 
+impl<T, I: InnerBase, A: Allocator> RawCollection<[T], I, A> {
+	pub unsafe fn into_array<const N: usize>(self) -> RawCollection<[T; N], I, A> {
+		RawCollection {
+			inner: self.inner,
+			cap: (),
+			_i: PhantomData
+		}
+	}
+}
+
 impl<S: ?Sized + Store, I: InnerBase, A: Allocator> RawCollection<S, I, A> {
+	pub fn is_dangling(&self) -> bool {
+		self.inner.is_dangling()
+	}
+	
 	pub fn inner_ptr(&self) -> NonNull<I> {
 		self.inner.inner_ptr()
 	}
@@ -470,12 +512,12 @@ impl<S: ?Sized + Store, I: InnerBase, A: Allocator> RawCollection<S, I, A> {
 		self.inner.ptr(I::BASE_LAYOUT)
 	}
 	
-	pub fn allocator(&self) -> &A {
+	pub const fn allocator(&self) -> &A {
 		self.inner.allocator()
 	}
 	
 	pub fn inner_len(&self) -> usize {
-		if self.inner.is_dangling() {
+		if self.is_dangling() {
 			0
 		} else {
 			// Safety: the pointer is checked to be not dangling.
@@ -491,42 +533,42 @@ impl<S: ?Sized + Store, I: InnerBase, A: Allocator> RawCollection<S, I, A> {
 	
 	pub fn strong_count<const ATOMIC: bool>(&self) -> Option<usize> {
 		// Safety: the pointer is not dangling.
-		(!self.inner.is_dangling()).then(|| unsafe {
+		(!self.is_dangling()).then(|| unsafe {
 			I::strong_count::<ATOMIC>(self.inner_ptr())
 		})
 	}
 	
 	pub fn strong_inc<const ATOMIC: bool>(&self) -> Option<usize> {
 		// Safety: the pointer is not dangling.
-		(!self.inner.is_dangling()).then(|| unsafe {
+		(!self.is_dangling()).then(|| unsafe {
 			I::strong_inc::<ATOMIC>(self.inner_ptr())
 		})
 	}
 	
 	pub fn strong_dec<const ATOMIC: bool>(&self) -> Option<usize> {
 		// Safety: the pointer is not dangling.
-		(!self.inner.is_dangling()).then(|| unsafe {
+		(!self.is_dangling()).then(|| unsafe {
 			I::strong_dec::<ATOMIC>(self.inner_ptr())
 		})
 	}
 	
 	pub fn weak_count<const ATOMIC: bool>(&self) -> Option<usize> {
 		// Safety: the pointer is not dangling.
-		(!self.inner.is_dangling()).then(|| unsafe {
+		(!self.is_dangling()).then(|| unsafe {
 			I::weak_count::<ATOMIC>(self.inner_ptr())
 		})
 	}
 	
 	pub fn weak_inc<const ATOMIC: bool>(&self) -> Option<usize> {
 		// Safety: the pointer is not dangling.
-		(!self.inner.is_dangling()).then(|| unsafe {
+		(!self.is_dangling()).then(|| unsafe {
 			I::weak_inc::<ATOMIC>(self.inner_ptr())
 		})
 	}
 	
 	pub fn weak_dec<const ATOMIC: bool>(&self) -> Option<usize> {
 		// Safety: the pointer is not dangling.
-		(!self.inner.is_dangling()).then(|| unsafe {
+		(!self.is_dangling()).then(|| unsafe {
 			I::weak_dec::<ATOMIC>(self.inner_ptr())
 		})
 	}
@@ -662,20 +704,34 @@ impl<S: ?Sized + Store, I: InnerBase, A: Allocator> RawCollection<S, I, A> {
 impl<T, I: InnerBase, A: Allocator> RawCollection<[T], I, A> {
 	#[track_caller]
 	pub unsafe fn reserve(&mut self, len: usize, additional: usize) {
-		self.inner.reserve(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>());
+		// Todo: move this check and initialization inside the inner `reserve` somehow?
+		if let Some(AllocState::Uninitialized) = self.inner.reserve(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>()) {
+			self.init_allocated();
+		}
 	}
 	
 	pub unsafe fn try_reserve(&mut self, len: usize, additional: usize) -> Result<(), AllocError> {
-		self.inner.try_reserve(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>())
+		// Todo: move this check and initialization inside the inner `try_reserve` somehow?
+		if let Some(AllocState::Uninitialized) = self.inner.try_reserve(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>())? {
+			self.init_allocated();
+		}
+		Ok(())
 	}
 	
 	#[track_caller]
 	pub unsafe fn reserve_exact(&mut self, len: usize, additional: usize) {
-		self.inner.reserve_exact(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>());
+		// Todo: move this check and initialization inside the inner `reserve_exact` somehow?
+		if let Some(AllocState::Uninitialized) = self.inner.reserve_exact(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>()) {
+			self.init_allocated();
+		}
 	}
 	
 	pub unsafe fn try_reserve_exact(&mut self, len: usize, additional: usize) -> Result<(), AllocError> {
-		self.inner.try_reserve_exact(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>())
+		// Todo: move this check and initialization inside the inner `try_reserve_exact` somehow?
+		if let Some(AllocState::Uninitialized) = self.inner.try_reserve_exact(len, &mut self.cap, additional, I::BASE_LAYOUT, Layout::new::<T>())? {
+			self.init_allocated();
+		}
+		Ok(())
 	}
 	
 	#[track_caller]
@@ -710,9 +766,13 @@ impl<S: ?Sized + Store, A: Allocator> RawVec<S, A> {
 	/// The elements within `len` must be initialized. The reference must be unique.
 	#[track_caller]
 	pub unsafe fn copy_out(&mut self, len: usize) -> Result<(), AllocError> {
+		// Decrement the strong count to zero. There are weak references, so we
+		// don't deallocate.
 		// A non-atomic write is safe here, as we are operating on a unique
 		// reference.
-		self.strong_dec::<false>();
+		if self.strong_dec::<false>().is_none() {
+			return Ok(())
+		}
 
 		// The outer length may have fallen out of sync with the inner length,
 		// which would cause elements to be lost without dropping after copying.
@@ -723,7 +783,7 @@ impl<S: ?Sized + Store, A: Allocator> RawVec<S, A> {
 		self.set_inner_len(0);
 
 		let capacity = self.capacity();
-		let Some(ptr) = self.inner.copy_out(
+		let Some(_) = self.inner.copy_out(
 			len,
 			capacity,
 			VecInner::<()>::BASE_LAYOUT,
@@ -731,6 +791,10 @@ impl<S: ?Sized + Store, A: Allocator> RawVec<S, A> {
 		)? else {
 			return Ok(())
 		};
+		
+		// Set the counts and length of the new allocation.
+		self.init_allocated();
+		self.set_inner_len(len);
 		Ok(())
 	}
 	
@@ -743,7 +807,7 @@ impl<S: ?Sized + Store, A: Allocator> RawVec<S, A> {
 	/// reference must be unique. The outer length should be set before calling.
 	#[track_caller]
 	pub unsafe fn truncate(&mut self, new_len: usize) {
-		if self.inner.is_dangling() {
+		if self.is_dangling() {
 			return
 		}
 		
@@ -1393,6 +1457,8 @@ impl<S: ?Sized + Store, A: Allocator> RawVec<S, A> {
 		};
 
 		let source = slice.cast::<S::T>();
+		
+		// Todo: use copy_nonoverlapping if the input is not from within the vector?
 
 		// Safety: elements within `slice.len` are valid.
 		for i in 0..slice.len() {

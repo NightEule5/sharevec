@@ -5,12 +5,21 @@ use alloc::alloc::Global;
 use alloc::{rc, sync};
 use core::alloc::Allocator;
 use core::marker::PhantomData;
-use core::fmt;
+use core::{fmt, ptr};
+use core::mem::ManuallyDrop;
+use core::num::NonZeroUsize;
+use core::ptr::NonNull;
+#[cfg(feature = "array-vec")]
+use crate::array::vec::ArrayVec;
+use crate::raw::{InnerBase, RawVec, VecInner};
+use crate::raw::inner::RawInnerVec;
 use super::Vec;
 
 pub struct Weak<T, A: Allocator, const ATOMIC: bool> {
-	_t: PhantomData<T>,
-	_a: PhantomData<A>
+	pub(crate) ptr: NonNull<VecInner>,
+	pub(crate) _t: PhantomData<T>,
+	pub(crate) cap: usize,
+	pub(crate) alloc: ManuallyDrop<A>,
 }
 
 impl<T, const ATOMIC: bool> Weak<T, Global, ATOMIC> {
@@ -96,15 +105,22 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// ```
 	#[must_use]
 	pub const fn new_in(alloc: A) -> Self {
-		todo!()
+		// `NonNull::without_provenance` is unstable.
+		// Safety: we know `usize::MAX` is non-zero.
+		let ptr = unsafe {
+			let raw_ptr: *mut VecInner =
+				ptr::without_provenance_mut(usize::MAX);
+			NonNull::new_unchecked(raw_ptr)
+		};
+		Self { ptr, _t: PhantomData, cap: 0, alloc: ManuallyDrop::new(alloc) }
 	}
 	
 	/// Returns a reference to the underlying allocator.
 	pub fn allocator(&self) -> &A {
-		todo!()
+		&self.alloc
 	}
 
-	/// Returns a raw pointer to the referenced array.
+	/// Returns a raw pointer to the referenced slice.
 	/// 
 	/// The pointer is valid only if there are strong references. Otherwise, the pointer may be
 	/// dangling, unaligned, or [`null`](core::ptr::null).
@@ -131,7 +147,8 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// ```
 	#[must_use]
 	pub fn as_ptr(&self) -> *const [T] {
-		todo!()
+		let thin_ptr = VecInner::store(self.ptr.cast());
+		ptr::slice_from_raw_parts(thin_ptr.cast().as_ptr(), self.capacity())
 	}
 	
 	/// Consumes the [`Weak`], returning its raw pointer.
@@ -160,7 +177,8 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_raw(self) -> *const [T] {
-		todo!()
+		let (ptr, _) = self.into_raw_with_allocator();
+		ptr
 	}
 
 	/// Consumes the [`Weak`], returning its raw pointer and allocator.
@@ -188,7 +206,7 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// let (raw, alloc) = strong.demote().into_raw_with_allocator();
 	///
 	/// assert_eq!(strong.weak_count(), 1);
-	/// assert_eq!(unsafe { &*raw }, b"Hello!");
+	/// assert_eq!(unsafe { &(*raw)[..6] }, b"Hello!");
 	///
 	/// drop(unsafe { Weak::from_raw_in(raw, alloc) });
 	/// assert_eq!(strong.weak_count(), 0);
@@ -196,7 +214,11 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_raw_with_allocator(self) -> (*const [T], A) {
-		todo!()
+		let mut md = ManuallyDrop::new(self);
+		let ptr = md.as_ptr();
+		// Safety: we semantically move `alloc` out while bypassing its dropper.
+		let alloc = unsafe { ManuallyDrop::take(&mut md.alloc) };
+		(ptr, alloc)
 	}
 
 	/// Converts a raw pointer previously returned by [`into_raw`] back into [`Weak`].
@@ -246,7 +268,13 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// [`promote`]: Self::promote
 	/// [`new`]: Self::new
 	pub unsafe fn from_raw_in(ptr: *const [T], alloc: A) -> Self {
-		todo!()
+		let cap = ptr.len();
+		let ptr = VecInner::from_store(
+			NonNull::new_unchecked(
+				ptr.cast_mut()
+			).cast()
+		);
+		Self { ptr, _t: PhantomData, cap, alloc: ManuallyDrop::new(alloc) }
 	}
 
 	/// Promotes the weak reference to a vector holding a strong reference to its contents.
@@ -270,25 +298,70 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// 
 	/// assert!(weak_vec.promote().is_none())
 	/// ```
-	pub fn promote(&self) -> Option<Vec<T, ATOMIC, A>> {
-		todo!()
+	pub fn promote(&self) -> Option<Vec<T, ATOMIC, A>>
+	where
+		A: Clone,
+	{
+		(self.strong_count() != 0).then(|| {
+			// Safety: the reference pointer was obtained from `demote` if the strong count is
+			//  non-zero, so this pointer is valid.
+			let mut vec = unsafe {
+				RawVec::<[T], _>::from_non_null(
+					VecInner::store(self.ptr.cast()).cast(),
+					self.capacity(),
+					(*self.alloc).clone()
+				)
+			};
+
+			// Increment the strong count to delay dropping.
+			vec.strong_inc::<ATOMIC>();
+
+			Vec { inner: vec, len: self.len() }
+		})
+	}
+
+	/// Returns the allocated capacity of the vector. 
+	pub const fn capacity(&self) -> usize {
+		self.cap
 	}
 
 	/// Returns the maximum length of the vector. 
 	pub fn len(&self) -> usize {
-		todo!()
+		if is_dangling(self.ptr) {
+			return 0
+		}
+
+		// Safety: the memory is always valid, as existence of a weak reference prevents it from
+		//  being deallocated.
+		unsafe {
+			VecInner::len(self.ptr.cast()).as_ptr().read()
+		}
 	}
 
 	/// Returns the number of strong references to the allocation.
 	#[must_use]
 	pub fn strong_count(&self) -> usize {
-		todo!()
+		if is_dangling(self.ptr) {
+			0
+		} else {
+			// Safety: the reference is not dangling.
+			unsafe {
+				VecInner::strong_count::<ATOMIC>(self.ptr.cast())
+			}
+		}
 	}
 	/// Returns the number of weak references to the allocation, or `0` if there are no remaining
 	/// strong pointers.
 	#[must_use]
 	pub fn weak_count(&self) -> usize {
-		todo!()
+		if self.strong_count() == 0 {
+			0
+		} else {
+			// Safety: the reference is not dangling.
+			unsafe {
+				VecInner::weak_count::<ATOMIC>(self.ptr.cast())
+			}
+		}
 	}
 
 	/// Returns `true` if this weak pointer points to the same allocation as `other`, or if both
@@ -317,24 +390,68 @@ impl<T, A: Allocator, const ATOMIC: bool> Weak<T, A, ATOMIC> {
 	/// let second = Weak::new();
 	/// assert!(first.ptr_eq(&second));
 	/// 
+	/// // Vec::new creates a dangling pointer too
 	/// let third = Vec::<u32>::new().demote();
-	/// assert!(!first.ptr_eq(&third));
+	/// assert!(first.ptr_eq(&third));
 	/// ```
 	#[must_use]
 	pub fn ptr_eq(&self, other: &Self) -> bool {
-		todo!()
+		self.ptr == other.ptr
 	}
+	
+	// Todo: add into_weak_array_vec?
+}
+
+fn is_dangling<T>(ptr: NonNull<T>) -> bool {
+	ptr.cast::<()>().addr() == NonZeroUsize::MAX
 }
 
 impl<T, A: Allocator, const ATOMIC: bool> Drop for Weak<T, A, ATOMIC> {
 	fn drop(&mut self) {
-		todo!()
+		if is_dangling(self.ptr) {
+			// Safety: we are manually dropping the allocator, and never touch it again.
+			unsafe {
+				ManuallyDrop::drop(&mut self.alloc);
+			}
+			return
+		}
+
+		if unsafe { VecInner::weak_dec::<ATOMIC>(self.ptr) } != 0 {
+			return
+		}
+		
+		let cap = self.capacity();
+
+		// If there are no strong references, deallocate the memory.
+		if self.strong_count() == 0 {
+			// Safety: we semantically move the allocator and never touch it from this field.
+			let alloc = unsafe {
+				ManuallyDrop::take(&mut self.alloc)
+			};
+			// Safety: there are no strong references to this memory. The memory is currently
+			//  allocated.
+			unsafe {
+				let mut vec = RawInnerVec::from_non_null(self.ptr.cast(), alloc);
+				RawVec::<[T], A>::deallocate(false, &mut vec, cap);
+			}
+		}
 	}
 }
 
 impl<T, A: Allocator + Clone, const ATOMIC: bool> Clone for Weak<T, A, ATOMIC> {
 	fn clone(&self) -> Self {
-		todo!()
+		// Clone the allocator first, in case it panics. In this case, the weak
+		// count is not incremented.
+		let alloc = self.alloc.clone();
+
+		if !is_dangling(self.ptr) {
+			// Safety: `ptr` is checked as non-dangling.
+			unsafe {
+				VecInner::weak_inc::<ATOMIC>(self.ptr);
+			}
+		}
+
+		Self { alloc, ..*self }
 	}
 }
 

@@ -4,7 +4,11 @@
 use alloc::alloc::Global;
 use alloc::rc::Rc;
 use core::alloc::Allocator;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::ptr;
 use core::ptr::NonNull;
+use crate::raw::RawVec;
 
 /// A contiguous, growable array type, with heap-allocated, reference-counted contents. Unlike
 /// [`Vec`], it can be cheaply cloned in *O*(1) time, sharing its contents between clones. As a
@@ -39,18 +43,18 @@ use core::ptr::NonNull;
 /// ```
 /// use sharevec::vec::rc::Vec;
 ///
-/// let mut vec: Vec<i32> = Vec::new();
+/// let mut vec: Vec<i32> = Vec::with_capacity(10);
 /// vec.try_push(1).unwrap();
 /// vec.try_push(2).unwrap();
 /// assert_eq!(vec.pop(), Some(2));
 /// ```
 ///
-/// ...unless it's been cloned:
+/// ...unless it's been cloned and has memory allocated:
 ///
 /// ```should_panic
 /// use sharevec::vec::rc::Vec;
 ///
-/// let mut vec: Vec<i32> = Vec::new();
+/// let mut vec: Vec<i32> = Vec::with_capacity(10);
 /// let shared = vec.clone();
 /// // Panic!
 /// vec.try_push(1).unwrap();
@@ -209,7 +213,10 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	/// See the example at [`into_raw_parts_with_alloc`](Self::into_raw_parts_with_alloc#examples).
 	pub unsafe fn from_raw_parts_in(ptr: *mut T, length: usize, capacity: usize, alloc: A) -> Self {
-		todo!()
+		Self {
+			inner: RawVec::<[_], _>::from_raw_parts(ptr, capacity, alloc),
+			len: length,
+		}
 	}
 
 	/// Creates a vector directly from a [`NonNull`] pointer, a length, a capacity, and an allocator.
@@ -246,7 +253,10 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	/// See the example at [`into_parts_with_alloc`](Self::into_parts_with_alloc#examples).
 	pub unsafe fn from_parts_in(ptr: NonNull<T>, length: usize, capacity: usize, alloc: A) -> Self {
-		todo!()
+		Self {
+			inner: RawVec::<[_], _>::from_non_null(ptr, capacity, alloc),
+			len: length,
+		}
 	}
 
 	/// Decomposes the vector into its raw components: pointer, length, and capacity.
@@ -269,7 +279,7 @@ impl<T, A: Allocator> Vec<T, A> {
 	/// ```
 	/// use sharevec::vec::rc::Vec;
 	///
-	/// let vec = Vec::from([-1, 0, 1]);
+	/// let vec = Vec::from([1, 2, 3]);
 	/// let (ptr, len, cap) = vec.into_raw_parts();
 	/// let rebuilt = unsafe {
 	///     // The pointer can be transmuted to a compatible type. Care must be
@@ -280,11 +290,12 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	///     Vec::from_raw_parts(ptr, len, cap)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_raw_parts(self) -> (*mut T, usize, usize) {
-		todo!()
+		let (ptr, len, cap, _) = self.into_raw_parts_with_alloc();
+		(ptr, len, cap)
 	}
 
 	/// Decomposes the vector into its raw components: `NonNull` pointer, length, and capacity.
@@ -318,11 +329,12 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	///     Vec::from_parts(ptr, len, cap)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_parts(self) -> (NonNull<T>, usize, usize) {
-		todo!()
+		let (ptr, len, cap, _) = self.into_parts_with_alloc();
+		(ptr, len, cap)
 	}
 
 	/// Decomposes the vector into its raw components: pointer, length, capacity, and allocator.
@@ -356,11 +368,12 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	///     Vec::from_raw_parts_in(ptr, len, cap, alloc)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_raw_parts_with_alloc(self) -> (*mut T, usize, usize, A) {
-		todo!()
+		let (ptr, len, cap, alloc) = self.into_parts_with_alloc();
+		(ptr.as_ptr(), len, cap, alloc)
 	}
 
 	/// Decomposes the vector into its raw components: `NonNull` pointer, length, capacity, and
@@ -395,11 +408,19 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	///     Vec::from_parts_in(ptr, len, cap, alloc)
 	/// };
-	/// assert_eq!(rebuilt, [-1i32 as u32, 0, 1]);
+	/// assert_eq!(rebuilt, [1, 2, 3]);
 	/// ```
 	#[must_use = "losing the pointer will leak memory"]
 	pub fn into_parts_with_alloc(self) -> (NonNull<T>, usize, usize, A) {
-		todo!()
+		let mut this = ManuallyDrop::new(self);
+		let ptr = this.as_non_null();
+		let len = this.len();
+		let cap = this.capacity();
+		// Safety: the allocator is moved out of `self`, and never touched again.
+		let alloc = unsafe {
+			ptr::read(this.inner.allocator())
+		};
+		(ptr, len, cap, alloc)
 	}
 
 	/// Returns a weak reference to the allocation. This does not count toward strong sharing, but
@@ -417,17 +438,36 @@ impl<T, A: Allocator> Vec<T, A> {
 	///
 	/// assert_eq!(vec.try_push(1), Ok(()));
 	/// ```
-	pub fn demote(&self) -> Weak<T, A> {
-		todo!()
+	pub fn demote(&self) -> Weak<T, A>
+	where
+		A: Clone
+	{
+		// Clone the allocator first, in case cloning panics. In this case, the
+		// weak count is not incremented.
+		let alloc = self.allocator().clone();
+		
+		if self.inner.is_dangling() {
+			Weak::new_in(alloc)
+		} else {
+			self.inner.weak_inc::<false>();
+			let ptr = self.inner.inner_ptr().cast();
+			let cap = self.capacity();
+			Weak {
+				ptr,
+				_t: PhantomData,
+				cap,
+				alloc: ManuallyDrop::new(alloc),
+			}
+		}
 	}
 }
 
-impl<T, A: Allocator> Unique<'_, T, A> {
+impl<T, A: Allocator + Clone> Unique<'_, T, A> {
 	/// Consumes the reference, returning a weak reference to the allocation.
 	///
 	/// Equivalent to [`Rc::downgrade`].
 	pub fn demote(self) -> Weak<T, A> {
-		todo!()
+		self.vec.demote()
 	}
 }
 
